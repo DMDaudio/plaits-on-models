@@ -37,6 +37,23 @@ Controls on the PLAITS machine:
 The engine set is chosen at build time. Any of PARTICLE, SNARE and HIHAT can be added back, or engines left out
 to save space and CPU.
 
+## Install
+
+There is no ready-made firmware file to download: the firmware is Elektron's, so you build it on your own computer
+from the official OS file. It takes a few minutes and no hardware. In short:
+
+1. Install Python 3 and the m68k cross compiler (`brew install m68k-elf-gcc` on macOS).
+2. Download `model-cycles_OS1.13.syx` (and, for a Model:Samples, `model-samples_OS1.13.syx`) from elektron.se.
+3. Clone the Modded-Cycles fork with the PLAITS files and run two commands: one makes the PLAITS machine, one builds
+   the OS with Model-TG, PLAITS and 6-channel USB.
+4. On a Model:Samples, convert the result with `tools/pack_for_samples.py`.
+5. Back up your projects, hold FUNC while powering on, press TRIG 4 (OS upgrade), and send the file from a MIDI
+   interface to the MIDI IN with any SysEx sender (the startup menu ignores USB).
+
+The exact commands, the Model:Cycles route, and how to go back to the stock OS are in
+[docs/build.md](docs/build.md). A modified OS is installed at your own risk; the startup menu and the official OS
+file always get you back.
+
 ## How it is put together
 
 - **The engines** ([engines/](engines/)) are Plaits rewritten in 32-bit integer arithmetic for the ColdFire
