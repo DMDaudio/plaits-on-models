@@ -1,0 +1,9 @@
+#ifndef PLAITS_SHIM_CSTRING_
+#define PLAITS_SHIM_CSTRING_
+#include <stddef.h>
+extern "C" {
+void* memcpy(void*, const void*, size_t); void* memset(void*, int, size_t);
+void* memmove(void*, const void*, size_t); int memcmp(const void*, const void*, size_t);
+}
+namespace std { using ::memcpy; using ::memset; using ::memmove; }
+#endif

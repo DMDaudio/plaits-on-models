@@ -1,0 +1,19 @@
+# never commit Elektron firmware, original or built
+*.syx
+*.zip
+*.bin
+firmware/
+out/
+build/
+# local builds and renders
+*.o
+*.so
+*.elf
+*.wav
+__pycache__/
+verification/chord_ref
+verification/chord_ref_d
+verification/swarm_ref
+verification/swarm_ref_d
+verification/wt_ref
+verification/wt_ref_d

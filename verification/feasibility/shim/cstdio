@@ -1,0 +1,4 @@
+#ifndef PLAITS_SHIM_CSTDIO_
+#define PLAITS_SHIM_CSTDIO_
+extern "C" int printf(const char*, ...);
+#endif

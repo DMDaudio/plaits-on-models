@@ -1,0 +1,17 @@
+// Minimal <cmath>: the handful of libm calls Plaits makes, all outside the
+// per-sample path (coefficient setup). Implemented in shim.cc.
+#ifndef PLAITS_SHIM_CMATH_
+#define PLAITS_SHIM_CMATH_
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+extern "C" {
+float sinf(float); float cosf(float); float tanf(float); float sqrtf(float);
+float expf(float); float logf(float); float powf(float, float); float floorf(float);
+double sin(double); double cos(double); double tan(double); double exp(double);
+double log(double); double log2(double); double sqrt(double); double pow(double, double);
+}
+inline float fabsf(float x) { return __builtin_fabsf(x); }
+inline double fabs(double x) { return __builtin_fabs(x); }
+namespace std { using ::sinf; using ::cosf; using ::fabsf; using ::fabs; using ::sqrtf; }
+#endif

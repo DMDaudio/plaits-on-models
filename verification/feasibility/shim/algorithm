@@ -1,0 +1,24 @@
+// Minimal <algorithm> for building Plaits freestanding on the ColdFire
+// (m68k-elf-gcc has no libstdc++). Only what Plaits and stmlib use.
+#ifndef PLAITS_SHIM_ALGORITHM_
+#define PLAITS_SHIM_ALGORITHM_
+#include <stddef.h>
+#include <cmath>
+#include <cstring>
+namespace std {
+template<class T> inline const T& min(const T& a, const T& b) { return b < a ? b : a; }
+template<class T> inline const T& max(const T& a, const T& b) { return a < b ? b : a; }
+template<class T> inline void swap(T& a, T& b) { T t = a; a = b; b = t; }
+template<class I, class T> inline void fill(I first, I last, const T& v) {
+  for (; first != last; ++first) *first = v;
+}
+template<class I, class O> inline O copy(I first, I last, O out) {
+  for (; first != last; ++first, ++out) *out = *first;
+  return out;
+}
+template<class I> inline void sort(I first, I last) {  // insertion sort: tiny arrays only
+  for (I i = first; i != last; ++i)
+    for (I j = i; j != first && *j < *(j - 1); --j) swap(*j, *(j - 1));
+}
+}  // namespace std
+#endif

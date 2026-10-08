@@ -1,0 +1,613 @@
+diff --git a/build.py b/build.py
+index 0e603b1..69e2418 100644
+--- a/build.py
++++ b/build.py
+@@ -28,6 +28,12 @@ REPO=os.path.dirname(os.path.abspath(__file__))
+ _ap=argparse.ArgumentParser(description="Build Model-TG from your own stock "
+                             "Model:Cycles OS 1.13 firmware.")
+ _ap.add_argument("--stock", help="your unmodified model-cycles_OS1.13.syx")
++PLAITS_ENGINES={"WSHAPE":"MACRO_WSH","FM":"MACRO_FM","NOISE":"MACRO_NOISE","PARTICLE":"MACRO_PARTICLE",
++                "BDRUM":"MACRO_BD","SNARE":"MACRO_SD","HIHAT":"MACRO_HH","GRAIN":"MACRO_GRAIN","CHORDS":"MACRO_CHORD",
++                "SWARM":"MACRO_SWARM","WAVETABLE":"MACRO_WAVETABLE"}
++_ap.add_argument("--plaits-engines", default="WSHAPE,FM,NOISE,BDRUM,GRAIN,CHORDS,SWARM,WAVETABLE",
++                 help="the Plaits mode's engines, in ENGN knob order (8 values each), from: "
++                      + ", ".join(PLAITS_ENGINES) + ". Leaving engines out saves their code.")
+ _ap.add_argument("--out", default="Model-TG.syx",
+                  help="the firmware to write (default: %(default)s)")
+ _ap.add_argument("--tool", default=os.environ.get("ELEKTRON_FIRMWARE_TOOL",
+@@ -90,19 +96,83 @@ def _as(srcfile,tag):
+     subprocess.run([CROSS+"as","-march=cfv4e","-o",o,srcfile],cwd=proto,check=True)
+     return o
+ _objs=[_as(src,"b"), _as("phase1.s","a"), _as("track_table.s","s")]
+-def _link(res_end):
+-    subprocess.run([CROSS+"ld",f"-Ttext=0x{BLOB:x}",
+-                    f"--defsym=blob_start=0x{BLOB:x}",f"--defsym=reserved_end=0x{res_end:x}",
+-                    "-o",elf,*_objs],check=True,stderr=subprocess.DEVNULL)
++# Plaits mode: Plaits' engines in C (src/macro/, digi1_mods' MACRO, MIT, and the engines ported here) and
++# their glue (src/macro_glue.c), compiled for the MCF54415 (no FPU). They RUN from PLT_RUN, the top of the
++# sample region that REGION_END (src/model_tg.s) leaves out, and are STORED in the image after the assembly;
++# boot_extra_hook copies them there before its clear (src/phase1.s). Only the assembly keeps cache blocks.
++# No .bss: zero-initialised data is placed in .data, so the copy brings all of it.
++PLT_RUN=0x46600000         # cached view of 0x4e600000..0x4e800000 (2 MiB); 0x46700000 up is Modded-Cycles'
++PLT_MAX=0x00100000         # what the code and data may take there
++CC=os.environ.get("CC_M68K") or next((c+"gcc" for c in ("m68k-elf-","m68k-linux-gnu-")
++                                     if shutil.which(c+"gcc")), "m68k-elf-gcc")
++_CFLAGS=["-mcpu=54418","-O2","-ffreestanding","-fno-builtin","-nostdlib","-fno-pic",
++         "-fomit-frame-pointer","-fno-common","-fno-zero-initialized-in-bss","-Wall","-Werror",
++         "-Wno-unused-function","-Wno-unused-const-variable",      # the engines left out
++         "-fno-tree-loop-distribute-patterns"]                     # no loop turned into a memset call
++_sel=[e.strip().upper() for e in args.plaits_engines.split(",") if e.strip()]
++_bad=[e for e in _sel if e not in PLAITS_ENGINES]
++if _bad or not _sel or len(set(_sel))!=len(_sel):
++    raise SystemExit(f"--plaits-engines: {args.plaits_engines!r}: one or more of {', '.join(PLAITS_ENGINES)}, each once")
++_CFLAGS.append("-DMACRO_SEL="+",".join(PLAITS_ENGINES[e] for e in _sel))
++_CFLAGS.append("-DMACRO_MASK=%#x" % sum(1 << list(PLAITS_ENGINES).index(e) for e in _sel))
++print(f"  Plaits engines, ENGN order: " + ", ".join(f"{e} {8*i}-{8*i+7 if i<len(_sel)-1 else 127}"
++                                                    for i,e in enumerate(_sel)))
++def _cc(srcfile,tag):
++    o=os.path.join(BUILD,f"_{tag}.o")
++    subprocess.run([CC,*_CFLAGS,"-I",proto,"-c",srcfile,"-o",o],cwd=proto,check=True)
++    _bad=[l for l in subprocess.run([CROSS+"objdump","-h",o],capture_output=True,text=True,
++          check=True).stdout.splitlines() if " .bss" in l and int(l.split()[2],16)]
++    assert not _bad, f"{srcfile}: .bss would not be in the copy to PLT_RUN: {_bad}"
++    return o
++_cobjs=[_cc("macro_glue.c","mg"), _cc("macro/macro.c","mc")]
++_objs+=_cobjs
++# undefined references from the C (libgcc, memset...) cannot be resolved here
++for _o in _cobjs:
++    _u=subprocess.run([CROSS+"nm","-u",_o],capture_output=True,text=True,check=True).stdout.split()
++    _u=[x for x in _u if x not in ("U",) and x not in ("macro_init","macro_trig","macro_render",
++        "macro_engine_of","macro_engine_name")]
++    assert not _u, f"{_o} needs {_u}"
++# A C global must not share a name with an assembly label: inside model_tg.s the local label wins, silently
++# (plt_out was once mc_out, which model_tg.s already uses in its machine-commit code).
++_asm_labels={l.split()[2] for _o in _objs if _o not in _cobjs for l in subprocess.run([CROSS+"nm",_o],
++             capture_output=True,text=True,check=True).stdout.splitlines() if len(l.split())==3}
++_c_globals={l.split()[2] for _o in _cobjs for l in subprocess.run([CROSS+"nm",_o],
++            capture_output=True,text=True,check=True).stdout.splitlines() if len(l.split())==3}
++assert not (_asm_labels & _c_globals), f"C symbols that clash with assembly labels: {_asm_labels & _c_globals}"
++_C_FUNCS={l.split()[2] for _o in _cobjs for l in subprocess.run([CROSS+"nm",_o],
++          capture_output=True,text=True,check=True).stdout.splitlines()
++          if len(l.split())==3 and l.split()[1] in "tT"}
++_LDS=os.path.join(BUILD,"plaits.ld")
++open(_LDS,"w").write(f"""/* build.py: the assembly at the first cache block; the Plaits C at PLT_RUN, loaded after it */
++SECTIONS
++{{
++  .text 0x{BLOB:x} : {{ *_b.o(.text .data .rodata*) *_a.o(.text .data .rodata*) *_s.o(.text .data .rodata*) }}
++  reserved_end = ALIGN(., 16);            /* the boot clear resumes here: the image's Plaits copy is cleared */
++  .plt 0x{PLT_RUN:x} : AT(reserved_end) {{ *_mg.o(.text .text.* .rodata* .data*) *_mc.o(.text .text.* .rodata* .data*)
++                                          . = ALIGN(16); }}
++  plt_load = LOADADDR(.plt);
++  plt_run = ADDR(.plt);
++  plt_size = SIZEOF(.plt);
++  /DISCARD/ : {{ *(.comment) *(.bss) *(COMMON) }}
++}}
++""")
++def _link():
++    # --no-warn-mismatch: the assembly is marked ISA_B+FPU (-march=cfv4e), the C ISA_C (-mcpu=54418);
++    # the MCF54415 runs both, and neither uses the FPU it does not have
++    subprocess.run([CROSS+"ld","--no-warn-mismatch","-T",_LDS,f"--defsym=blob_start=0x{BLOB:x}",
++                    "-o",elf,*_objs],check=True)
+     subprocess.run([CROSS+"objcopy","-O","binary",elf,binf],check=True)
+     return open(binf,'rb').read()
+-# reserved_end is only an operand, so the size cannot depend on it: link once
+-# to measure, once for real, and check that held.
+-_probe=_link(0)
+-RES_END=BLOB+((len(_probe)+15)&~15)
+-_real=_link(RES_END)
+-assert len(_real)==len(_probe), "blob size changed between the two link passes"
+-print(f"  one blob: {len(_real):,} B at 0x{BLOB:08x}, reserved_end 0x{RES_END:08x}")
++_real=_link()
++_ls={l.split()[2]:int(l.split()[0],16) for l in subprocess.run([CROSS+"nm",elf],capture_output=True,
++     text=True,check=True).stdout.splitlines() if len(l.split())==3}
++RES_END=_ls["reserved_end"]
++PLT_LOAD,PLT_SIZE=_ls["plt_load"],_ls["plt_size"]
++assert _ls["plt_run"]==PLT_RUN and PLT_LOAD==RES_END and PLT_SIZE%4==0
++assert PLT_SIZE<=PLT_MAX, f"the Plaits code is {PLT_SIZE:,} B, over its {PLT_MAX:,} B at 0x{PLT_RUN:08x}"
++assert len(_real)==RES_END-BLOB+PLT_SIZE, "the binary is not the assembly, then the Plaits load image"
++print(f"  assembly {RES_END-BLOB:,} B at 0x{BLOB:08x} (reserved_end 0x{RES_END:08x}); "
++      f"Plaits {PLT_SIZE:,} B stored after it, run at 0x{PLT_RUN:08x}")
+ # Every stack frame must be freed with the size it was allocated with. Scoping
+ # by label gives false positives (local labels like pf_ret: look like functions),
+ # so just require that each allocation size has a matching free size somewhere -
+@@ -180,7 +250,7 @@ _wrapped=[]; _in=None
+ for _l in _dis.splitlines():
+     _h=_re.match(r'^[0-9a-f]{8} <([^>]+)>:',_l)
+     if _h: _in=_h.group(1); continue
+-    if _in in _DATA_LABELS: continue
++    if _in in _DATA_LABELS or _in in _C_FUNCS: continue    # gcc branches to .L labels
+     _m=_re.search(r'^\s*([0-9a-f]{8}):\s+[0-9a-f]{4} [0-9a-f]{4}\s*\t(bsrw|braw|b\w\ww)\s+([0-9a-f]{6,8})',_l)
+     if _m and int(_m.group(3),16) not in _labels:
+         _wrapped.append(_l.strip())
+@@ -282,7 +352,9 @@ if hashlib.sha256(_stock).hexdigest()!=STOCK_SHA256:
+ assert BASE+len(_stock)==STOCK_END, (hex(BASE+len(_stock)), "unexpected stock size")
+ d=_stock+bytearray(BLOB-STOCK_END)+blob
+ end=BASE+len(d)
+-assert end==RES_END, f"image ends 0x{end:08x} but the boot clear resumes at 0x{RES_END:08x}"
++assert end==PLT_LOAD+PLT_SIZE, f"image ends 0x{end:08x}, not after the Plaits load image"
++assert end<=0x40200000, f"image ends 0x{end:08x}, past the bootstrap's work area at 0x40200000"
++print(f"  image ends 0x{end:08x}: {0x40200000-end:,} B left below the bootstrap's 0x40200000")
+ 
+ # ---- Phase 1 stock-area patches -----------------------------------------
+ # Derived from the base image, each asserted against the STOCK bytes it
+@@ -702,7 +774,7 @@ assert d[o]==6, d[o]
+ # including the filesystem's chunk-blanking buffer. Check the BUILT hook, not
+ # the source, since that is exactly where the mismatch hid last time.
+ _h=sym['boot_extra_hook']-BASE
+-_hook=bytes(d[_h:_h+64])
++_hook=bytes(d[_h:_h+128])
+ for _need,_what in ((b'\x41\xf9'+struct.pack('>I',0x4019b590),'starts at 0x4019b590'),
+                     (b'\xb1\xfc'+struct.pack('>I',BLOB),      f'skips from 0x{BLOB:08x}'),
+                     (b'\x20\x7c'+struct.pack('>I',RES_END),   f'resumes at 0x{RES_END:08x}'),
+@@ -800,11 +872,12 @@ print(f"  6 page ids {[hex(i) for i in _ids]} -> slots {sorted(str(s) for s in _
+ # 0x40079310 skips them too: it requires entry+8 (valid) to be non-zero, and
+ # nothing ever allocates them, so it stays 0 from the BSS clear.
+ CACHE_BASE, CACHE_ENTRY, CACHE_BLK = 0x401ab750, 0x401eb750, 16384
+-nres=(end-CACHE_BASE+CACHE_BLK-1)//CACHE_BLK     # blocks the blob occupies
++nres=(RES_END-CACHE_BASE+CACHE_BLK-1)//CACHE_BLK  # blocks the assembly occupies (the Plaits copy is gone)
+ # 5 since samplerID (the retrig page's master FX); samplerHN-IC fit in 4.
+ # 11 of 16 blocks stay the
+ # filesystem's; our own sample loading reads the eMMC directly, not through it.
+-assert 1<=nres<=6, f"blob spans {nres} cache blocks - too much of the cache"
++# 8 with Macro mode (Plaits' engines, ~45 KB): half the cache stays the filesystem's.
++assert 1<=nres<=8, f"blob spans {nres} cache blocks - too much of the cache"
+ # head = first entry we do NOT occupy; the prev-link loop starts one past it
+ for addr,old,newv,what in ((0x400792f2, 0x401eb750, CACHE_ENTRY+20*nres,      'LRU head'),
+                            (0x400792bc, 0x401eb774, CACHE_ENTRY+20*(nres+1)+16,'prev-link loop start')):
+@@ -814,13 +887,13 @@ for addr,old,newv,what in ((0x400792f2, 0x401eb750, CACHE_ENTRY+20*nres,      'L
+     d[o:o+4]=struct.pack('>I',newv)
+     print(f"  0x{addr:08x} -> 0x{newv:08x}  ({what}, entry {nres if addr==0x400792f2 else nres+1})")
+ limit=CACHE_BASE+nres*CACHE_BLK
+-assert end<=limit, f"blob ends 0x{end:08x}, past its reserved cache blocks (0x{limit:08x})"
+-print(f"  reserved {nres} of 16 cache blocks; blob ends 0x{end:08x}, limit 0x{limit:08x} "
+-      f"({limit-end:,} B spare)")
++assert RES_END<=limit, f"assembly ends 0x{RES_END:08x}, past its reserved cache blocks (0x{limit:08x})"
++print(f"  reserved {nres} of 16 cache blocks; assembly ends 0x{RES_END:08x}, limit 0x{limit:08x} "
++      f"({limit-RES_END:,} B spare)")
+ 
+ open(out,'wb').write(d)
+-assert end % 16 == 0, f"reserved_end 0x{end:08x} is not 16-byte aligned"
+-print(f"  blob {len(blob):,} B, image {len(d):,} B, reserved_end 0x{end:08x} (16-aligned)")
++assert RES_END % 16 == 0, f"reserved_end 0x{RES_END:08x} is not 16-byte aligned"
++print(f"  blob {len(blob):,} B, image {len(d):,} B, reserved_end 0x{RES_END:08x} (16-aligned)")
+ 
+ # ---- the MAIN OS hash, for the release notes ------------------------------
+ RESULT_SHA256=hashlib.sha256(bytes(d)).hexdigest()
+diff --git a/src/model_tg.s b/src/model_tg.s
+index 2dc0a64..da6c9d5 100644
+--- a/src/model_tg.s
++++ b/src/model_tg.s
+@@ -538,6 +538,8 @@ sw_nowrap:
+     beqw    sw_pluck              | pluck: strike and string parameters
+     cmpil   #6,%d0
+     beqw    sw_wave               | wavetable: frames, morph and unison
++    cmpil   #MC_MODE,%d0
++    beqw    sw_macro              | Macro: the four dials are the engine's
+     cmpil   #2,%d0
+     beqw    sw_done               | slice mode owns its window; sampler_render
+                                   | sets it, because only there is the pitch
+@@ -760,6 +762,31 @@ sw_g_none:
+     clrl    %a1@(0,%d2:l:4)
+     braw    sw_done
+ 
++    | ---- macro: Start = ENGN, End = HARM, Filter = TIMB, Res = MORP, each
++    | 0..127 into plt_prm[track] for plt_fill (src/macro_glue.c). The dials are
++    | trackData +22..+28, contiguous words, 0..32512.
++sw_macro:
++    movel   %d2,%d0
++    lsll    #2,%d0
++    lea.l   plt_prm,%a1
++    addal   %d0,%a1
++    lea.l   %a2@(22),%a0
++    moveq   #3,%d4
++sw_mc_l:
++    mvsw    %a0@+,%d1
++    bges    sw_mc_p
++    moveq   #0,%d1
++sw_mc_p:
++    asrl    #8,%d1
++    cmpil   #127,%d1
++    bles    sw_mc_s
++    moveq   #127,%d1
++sw_mc_s:
++    moveb   %d1,%a1@+
++    subql   #1,%d4
++    bpls    sw_mc_l
++    braw    sw_done
++
+     | ---- pluck: Start = strike position, End = strike length, Filter = Tone,
+     | Res = Feedback. Tables in granular_tables.inc.
+ sw_pluck:
+@@ -1099,6 +1126,8 @@ sp_flt_done:
+     beqs    sp_pluck_trig
+     cmpil   #6,%d0
+     beqs    sp_wave_trig
++    cmpil   #MC_MODE,%d0
++    beqw    sp_macro_trig
+     cmpil   #2,%d0
+     bnes    sp_start_dial
+     | Slice mode: which slice this is depends on THIS block's pitch, and the
+@@ -1130,6 +1159,13 @@ sp_wave_trig:
+     moveb   %d0,%a0@(0,%d2:l)
+     braw    sp_no_trig
+ 
++sp_macro_trig:
++    | Macro: the engine is struck on this very block (plt_fill)
++    lea.l   plt_trig,%a0
++    moveq   #1,%d0
++    moveb   %d0,%a0@(0,%d2:l)
++    braw    sp_no_trig
++
+ sp_start_dial:
+     bsr     seed_start
+     lea.l   pp_dir,%a0            | ping-pong starts out going the dial's way
+@@ -1650,6 +1686,10 @@ sv_havestep:
+     | (0..0xFFFFF) that was then passed to the DSP calls as the output buffer:
+     | a write into the vector page, i.e. the random browsing exception.
+     movel   %d3,%sp@(40)
++    lea.l   loop_mode,%a0         | Macro: Plaits' engines, no sample at all
++    moveq   #MC_MODE,%d6
++    cmpl    %a0@(0,%d4:l:4),%d6
++    beqw    sv_macro
+     lea.l   track_slot,%a0         | a0 is dead here (voice was reloaded into d2)
+     movel   %a0@(0,%d4:l:4),%d0
+     bpls    sv_loaded
+@@ -1805,6 +1845,25 @@ sv_wv1:
+     lea.l   %sp@(16),%sp
+     movel   %sp@(40),%d3          | outBuf back
+     braw    sv_nofilt
++sv_macro:
++    | Macro (src/macro_glue.c): plt_fill(track, step Q16, the 2x buffer), the
++    | step rebuilt from sp@(32) and d1 as Pluck's is. It writes the 64 longs a
++    | PCM fill would, so the decimator and the amp stages follow as for Wave.
++    | A C function: d0-d1/a0-a1 are its scratch, everything else it keeps.
++    movel   %sp@(32),%d6
++    swap    %d6
++    clrw    %d6
++    movel   %d1,%d0
++    clrw    %d0
++    swap    %d0
++    orl     %d0,%d6
++    pea     sampler_buf+32
++    movel   %d6,%sp@-             | step, Q16
++    movel   %d4,%sp@-             | track
++    jsr     plt_fill
++    lea.l   %sp@(12),%sp
++    movel   %sp@(40),%d3          | outBuf back
++    braw    sv_nofilt
+ sv_notgran:
+     | ---- stereo: the side plane goes through this same fill first --------
+     | A stereo slot holds two planes, mid (L+R)/2 then side (L-R)/2, slot_soff
+@@ -7348,7 +7407,7 @@ gran_menu_open:
+     bnew    gm_done
+     lea.l   loop_mode,%a0         | each mode has its own list of settings
+     movel   %a0@(0,%d2:l:4),%d0
+-    cmpil   #6,%d0
++    cmpil   #MC_MODE,%d0
+     bhiw    gm_done
+     lea.l   gm_descs,%a0
+     movel   %a0@(0,%d0:l:4),%d0
+@@ -8155,7 +8214,7 @@ gm_track:      .long 0
+ gm_cur:        .long gm_desc_gran   | the menu being built / shown
+ | a list menu: title, view name, rows, and per row {label, value, turn, press}
+ gm_descs:      .long gm_desc_os, gm_desc_lp, gm_desc_sl, gm_desc_gran
+-               .long gm_desc_st, gm_desc_pk, gm_desc_wv
++               .long gm_desc_st, gm_desc_pk, gm_desc_wv, gm_desc_mc
+ gm_desc_os:    .long mo_t_os, gm_vname, 3, mo_i_os
+ gm_desc_lp:    .long mo_t_lp, gm_vname, 5, mo_i_lp
+ gm_desc_sl:    .long mo_t_sl, gm_vname, 6, mo_i_sl
+@@ -8163,6 +8222,7 @@ gm_desc_gran:  .long gm_title, gm_vname, 4, gm_items
+ gm_desc_st:    .long mo_t_st, gm_vname, 2, mo_i_st
+ gm_desc_pk:    .long mo_t_pk, gm_vname, 3, mo_i_pk
+ gm_desc_wv:    .long mo_t_wv, gm_vname, 1, mo_i_chn
++gm_desc_mc:    .long mo_t_mc, gm_vname, 1, mo_i_mc
+ gm_items:      .long gm_lab_shape, gm_val_shape, gm_rot_shape, new_slot2_invoker
+                .long gm_lab_dir,   gm_val_dir,   gm_rot_dir,   new_slot2_invoker
+                .long gm_lab_frz,   gm_val_frz,   gm_rot_frz,   new_slot2_invoker
+@@ -8186,6 +8246,8 @@ mo_i_st:       .long mo_l_mod, mo_v_stm, mo_r_stm, new_slot2_invoker
+ mo_i_pk:       .long mo_l_mod, mo_v_pkm, mo_r_pkm, new_slot2_invoker
+                .long mo_l_exc, mo_v_exc, mo_r_exc, new_slot2_invoker
+ mo_i_chn:      .long mo_l_chn, mo_v_chn, mo_r_chn, new_slot2_invoker
++mo_i_mc:       .long mo_l_out, mo_v_out, mo_r_out, new_slot2_invoker
++mo_n_out:      .long mo_s_out, mo_s_mix, mo_s_aux
+ mo_n_efx:      .long mo_s_flt, mo_s_lof, mo_s_tap, mo_s_vin, gm_v_off
+ mo_n_chn:      .long mo_s_mon, mo_s_ste
+ mo_n_stu:      .long gm_v_off, mo_s_4, mo_s_8, mo_s_16, mo_s_32, mo_s_8t, mo_s_16t
+@@ -8211,6 +8273,7 @@ mo_t_sl:       .asciz "Slice"
+ mo_t_st:       .asciz "Stretch"
+ mo_t_pk:       .asciz "Pluck"
+ mo_t_wv:       .asciz "Wave"
++mo_t_mc:       .asciz "Plaits"
+ mo_s_efx:      .asciz "EFX"
+ mo_s_chnl:     .asciz "CHN"
+ mo_s_stul:     .asciz "STU"
+@@ -8220,6 +8283,9 @@ mo_s_synl:     .asciz "SYN"
+ mo_s_modl:     .asciz "MOD"
+ mo_s_slcl:     .asciz "SLC"
+ mo_s_excl:     .asciz "EXC"
++mo_s_out:      .asciz "OUT"
++mo_s_mix:      .asciz "MIX"
++mo_s_aux:      .asciz "AUX"
+ mo_s_flt:      .asciz "FLT"
+ mo_s_lof:      .asciz "LOF"
+ mo_s_tap:      .asciz "TAP"
+@@ -8287,6 +8353,8 @@ mo_l_slc:  lea.l mo_s_slcl,%a1
+            braw  gm_lab
+ mo_l_exc:  lea.l mo_s_excl,%a1
+            braw  gm_lab
++mo_l_out:  lea.l mo_s_out,%a1
++           braw  gm_lab
+ mo_l_edt:  lea.l mo_s_edtl,%a1
+            braw  gm_lab
+ mo_l_seq:  lea.l mo_s_seql,%a1
+@@ -8359,6 +8427,9 @@ mo_v_pkm:  lea.l pk_mode,%a0
+ mo_v_exc:  lea.l pk_exc,%a0
+            lea.l mo_n_exc,%a1
+            braw  gm_valt
++mo_v_out:  lea.l plt_out,%a0       | Macro: Plaits' OUT, a crossfade, its AUX
++           lea.l mo_n_out,%a1
++           braw  gm_valt
+ mo_r_efx:  lea.l fx_sel,%a1
+            moveq #5,%d1
+            braw  gm_rot
+@@ -8398,6 +8469,9 @@ mo_r_pkm:  lea.l pk_mode,%a1
+ mo_r_exc:  lea.l pk_exc,%a1
+            moveq #3,%d1
+            braw  gm_rot
++mo_r_out:  lea.l plt_out,%a1
++           moveq #3,%d1
++           braw  gm_rot
+ | three letters each: the value column starts well right of the label
+ gm_s_shape:    .asciz "SHP"
+ gm_s_dir:      .asciz "DIR"
+@@ -8943,7 +9017,8 @@ ms_out:
+ | one filled, exactly where the machine page draws its six. Names in the 5x9
+ | font (0x40ea14cc): the widest, "Granular", is 8 characters.
+ MM_FONT  = 0x40ea14cc
+-MM_MODES = 7
++MM_MODES = 8
++MC_MODE  = 7                      | Macro, the eighth
+ mm_render:
+     lea.l   %sp@(-24),%sp
+     moveml  %d2-%d6/%a2,%sp@
+@@ -9141,6 +9216,7 @@ mm_r_end:
+ mm_obj:        .long 0          | the menu page while it is up
+ mm_track:      .long 0          | the track it edits
+ mm_names:      .long msg_oneshot, msg_loop, msg_slice, msg_gran, msg_strch, msg_pluck, msg_wave
++               .long msg_macro
+ mm_kind:       .long 0          | 0 = mode menu, 1 = slice menu, 3 = System
+ mm_kind_req:   .long 0
+ mm_opened:     .long 0          | the last open request brought a menu up
+@@ -9148,7 +9224,7 @@ mm_desc:       .long 0          | the option list on screen (kind 2)
+ | Each mode's option list: {per-track values, how many, then line 1 and
+ | line 2 of every option}. Indexed by mode; 0 = the mode has none here
+ | (Slice has its own menu, Granular will get one of its own).
+-opt_menus:     .long om_os, om_lp, 0, 0, om_st, om_pk, 0
++opt_menus:     .long om_os, om_lp, 0, 0, om_st, om_pk, 0, 0
+ om_os:         .long os_opt, 7
+                .long msg_oneshot, msg_normal, msg_oneshot, msg_lofi
+                .long msg_oneshot, s_tape, msg_oneshot, s_vinyl
+@@ -9293,6 +9369,7 @@ msg_gran:      .asciz "Granular"
+ msg_strch:     .asciz "Stretch"
+ msg_pluck:     .asciz "Pluck"
+ msg_wave:      .asciz "Wave"
++msg_macro:     .asciz "Plaits"
+ msg_lofi:      .asciz "Lo-fi"
+     .align 2
+ mod_held:      .long 0   | the attack modifier is down: Decay is Attack
+@@ -9340,6 +9417,9 @@ apply_names:
+     cmpil   #5,%d0
+     beqs    an_loop
+     lea.l   tv_swap,%a1
++    cmpil   #6,%d0
++    beqs    an_loop
++    lea.l   macro_swap,%a1
+ an_loop:
+     movel   %a1@,%d0              | entry byte offset, -1 terminates
+     bmis    an_done
+@@ -9365,6 +9445,14 @@ an_next:
+     lea.l   %a1@(28),%a1
+     bras    an_loop
+ an_done:
++    tstl    %d1                   | Macro: ENGN and HARM are plain 0..127,
++    beqs    an_dn                 | no decimals
++    lea.l   ui_gran,%a0
++    moveq   #7,%d0
++    cmpl    %a0@,%d0
++    bnes    an_dn
++    moveq   #0,%d1
++an_dn:
+     | Start and End show two decimals while our labels are up, so the fine steps
+     | fine_hook makes are visible. The display calls the invoker at record+0x20
+     | of the parameter's 100-byte UI record (0x40a71754 + id*100) as
+@@ -9676,7 +9764,7 @@ dbh_pass:
+ | array. It also lifts the ceiling from the 16.2 MiB buddy heap (shared with the
+ | entire firmware) to 64 MiB that nothing else claims.
+     REGION_BASE = 0x4a800000
+-    REGION_END  = 0x4e800000
++    REGION_END  = 0x4e600000      | Plaits mode: the top 2 MiB are its code (PLT_RUN, build.py)
+     TBL_BUF     = 0x4a800000      | 64 KiB inode-table page
+     PCM_BASE    = 0x4a810000      | the sample file image
+     MAX_TRK     = 6
+@@ -10882,7 +10970,12 @@ ns_pluck:
+     moveq   #80,%d4               | 'P' pluck
+     bras    ns_mode
+ ns_wave:
++    cmpil   #6,%d4
++    bnes    ns_macro
+     moveq   #87,%d4               | 'W' wavetable
++    bras    ns_mode
++ns_macro:
++    moveq   #77,%d4               | 'M' macro
+ ns_mode:
+     moveb   %d4,%a2@+
+     | Byte 12: the slice option, 'A' + 0..5. A project saved before this has 0
+@@ -10953,6 +11046,9 @@ ns_st_done:
+ | old range (0..5). The product is now 248,935,680, still under 2^28, and 7
+ | in bits 28-31 is no more possible in samplerGI's layout than 15 was.
+ ST_TAG     = 0x70000000
++ST_TAG_MC  = 0x60000000           | this layout, the mode Macro: the mode field
++                                  | (0..6) holds the Plaits option, plt_out, since
++                                  | an eighth mode would not fit the 2^28
+ ST_TAG_OLD = 0xF0000000
+ ST_TAGMASK = 0xF0000000
+ ST_DEFAULT = ST_TAG + 35280       | the tag and sl_cfg = 1 (16 equal slices):
+@@ -11037,6 +11133,7 @@ state_store:
+     movea.l %d0,%a2
+     lea.l   st_fields_end,%a1     | last field first: acc = acc * range + value
+     moveq   #0,%d3
++    moveq   #0,%d1                | 1: the mode is Macro
+ ss_f:
+     lea.l   %a1@(-16),%a1
+     movel   %a1@(12),%d0
+@@ -11044,6 +11141,14 @@ ss_f:
+     mulul   %d0,%d3
+     movea.l %a1@,%a0
+     movel   %a0@(0,%d2:l:4),%d0
++    cmpal   #st_fields,%a1        | the mode field: Macro stores its option
++    bnes    ss_nmc
++    cmpil   #MC_MODE,%d0
++    bnes    ss_nmc
++    moveq   #1,%d1
++    lea.l   plt_out,%a0
++    movel   %a0@(0,%d2:l:4),%d0
++ss_nmc:
+     cmpl    %a1@(12),%d0          | out of range can only be a bug: store 0
+     blss    ss_v
+     moveq   #0,%d0
+@@ -11051,7 +11156,13 @@ ss_v:
+     addl    %d0,%d3
+     cmpal   #st_fields,%a1
+     bhis    ss_f
++    tstl    %d1
++    beqs    ss_tag
++    orl     #ST_TAG_MC,%d3
++    bras    ss_put
++ss_tag:
+     orl     #ST_TAG,%d3
++ss_put:
+     movel   %d3,%a2@(72)
+ ss_out:
+     moveml  %sp@,%d1-%d3/%a0-%a2
+@@ -11086,6 +11197,9 @@ st_apply:
+     moveq   #0,%d4                | this layout
+     cmpil   #ST_TAG,%d0
+     beqs    sa_ok
++    moveq   #2,%d4                | this layout, the mode Macro
++    cmpil   #ST_TAG_MC,%d0
++    beqs    sa_ok
+     moveq   #1,%d4                | samplerIR's and before: sl_cfg 0..5
+     cmpil   #ST_TAG_OLD,%d0
+     bnew    sa_no                 | no state, or one in an older layout
+@@ -11097,8 +11211,8 @@ sa_set:
+     beqs    sa_der
+     movel   %a1@(12),%d1
+     addql   #1,%d1
+-    tstl    %d4
+-    beqs    sa_rng
++    cmpil   #1,%d4
++    bnes    sa_rng
+     cmpal   #st_f_slc,%a1
+     bnes    sa_rng
+     moveq   #6,%d1
+@@ -11110,6 +11224,15 @@ sa_rng:
+     subl    %d3,%d0
+     negl    %d0                   | acc % range
+     movea.l %a1@,%a0
++    cmpil   #2,%d4                | Macro: the mode field is its option, and
++    bnes    sa_put                | the mode is Macro
++    cmpal   #st_fields,%a1
++    bnes    sa_put
++    lea.l   plt_out,%a0
++    movel   %d0,%a0@(0,%d2:l:4)
++    lea.l   loop_mode,%a0
++    moveq   #MC_MODE,%d0
++sa_put:
+     movel   %d0,%a0@(0,%d2:l:4)
+     movel   %sp@+,%d3
+     lea.l   %a1@(16),%a1
+@@ -11267,8 +11390,13 @@ np_pluck:
+     bras    np_mode
+ np_wave:
+     cmpil   #87,%d0               | 'W' wavetable
+-    bnes    np_lofi
++    bnes    np_macro
+     moveq   #6,%d1
++    bras    np_mode
++np_macro:
++    cmpil   #77,%d0               | 'M' macro
++    bnes    np_lofi
++    moveq   #MC_MODE,%d1
+ np_lofi:
+ np_mode:
+     lea.l   loop_mode,%a0
+@@ -19209,6 +19337,11 @@ gw_tv:
+     bras    gw_set
+ gw_modes:
+     movel   %a0@(0,%d0:l:4),%d0
++    cmpil   #MC_MODE,%d0
++    bnes    gw_nmc
++    moveq   #7,%d1                | 7 Macro
++    bras    gw_set
++gw_nmc:
+     subql   #2,%d0                | 3 -> 1 granular, 4 -> 2 stretch, 5 -> 3 pluck,
+     bles    gw_set                | 6 -> 4 wavetable; 5 = One shot's Lo-fi
+     cmpil   #4,%d0
+diff --git a/src/name_swap.inc b/src/name_swap.inc
+index 7baae6e..100ffeb 100644
+--- a/src/name_swap.inc
++++ b/src/name_swap.inc
+@@ -53,3 +53,10 @@ tv_swap:
+     .long 4088, str_tvtone, str_tvcat, str_tvtonesh, 0x40129ab6, 0x4012996f, 0x401299c7
+     .long 4144, str_tvwear, str_tvcat, str_tvwearsh, 0x40129ac2, 0x4012996f, 0x401299d9
+     .long -1,0,0,0,0,0,0
++| ...and for Macro mode (Plaits' engines, src/macro_glue.c)
++macro_swap:
++    .long 2576, str_mceng,  str_mccat, str_mcengsh,  0x4012999c, 0x4012996f, 0x401299a7
++    .long 3472, str_mcharm, str_mccat, str_mcharmsh, 0x40129a4d, 0x4012996f, 0x401299b7
++    .long 4088, str_mctimb, str_mccat, str_mctimbsh, 0x40129ab6, 0x4012996f, 0x401299c7
++    .long 4144, str_mcmorp, str_mccat, str_mcmorpsh, 0x40129ac2, 0x4012996f, 0x401299d9
++    .long -1,0,0,0,0,0,0
+diff --git a/src/phase1.s b/src/phase1.s
+index bf91828..5a8165c 100644
+--- a/src/phase1.s
++++ b/src/phase1.s
+@@ -34,6 +34,18 @@ boot_extra_hook:
+     lea.l   %sp@(-16),%sp
+     moveml  %d4-%d7,%sp@
+ 
++    | The Plaits mode's C (build.py, PLT_RUN): from its load image, right after
++    | this blob, to where it runs, in the 2 MiB REGION_END leaves out at the top
++    | of the sample region. Before the clear below, which zeroes the load image,
++    | and before the caches are enabled. a0/a1 are free here, as d4.
++    lea.l   plt_load,%a0
++    lea.l   plt_run,%a1
++    movel   #plt_size,%d4
++plt_copy:
++    movel   %a0@+,%a1@+
++    subql   #4,%d4
++    bgts    plt_copy
++
+     | The sample region's upper 64 MiB block group, 0x4C000000-0x4FFFFFFF,
+     | into the data cache, write-through (ACR1 - stock sets only ACR0, for
+     | 0x40000000-0x47FFFFFF, copyback; everything else defaults to
+diff --git a/src/sampler_strings.inc b/src/sampler_strings.inc
+index 0c0d048..236a099 100644
+--- a/src/sampler_strings.inc
++++ b/src/sampler_strings.inc
+@@ -46,6 +46,15 @@ str_wpossh:   .asciz "POS"
+ str_wsizesh:  .asciz "SIZE"
+ str_wsmthsh:  .asciz "SMTH"
+ str_wdetsh:   .asciz "DTUN"
++str_mceng:    .asciz "Engine"
++str_mcharm:   .asciz "Harmonics"
++str_mctimb:   .asciz "Timbre"
++str_mcmorp:   .asciz "Morph"
++str_mccat:    .asciz "Plaits"
++str_mcengsh:  .asciz "ENGN"
++str_mcharmsh: .asciz "HARM"
++str_mctimbsh: .asciz "TIMB"
++str_mcmorpsh: .asciz "MORP"
+     .align 2
+ str_lrate:    .asciz "Rate"
+ str_lcrsh:    .asciz "Crush"
