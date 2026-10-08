@@ -21,6 +21,8 @@ risk. No firmware is distributed here: you build it from your own copy of the of
 | 5 | CHORDS | chords (string machine, then wavetable) |
 | 6 | SWARM | swarm of 8 grains or glissandi |
 | 7 | WAVES | 8x8x4 wavetable |
+| 8 | MODAL | modal resonator: struck bells, bars and plates |
+| 9 | STRING | inharmonic string: plucked, buzzing or piano-like strings |
 
 Controls on the PLAITS machine:
 

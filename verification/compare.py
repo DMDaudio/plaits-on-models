@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The fixed-point CHORD (Model-TG src/macro/macro.c) against Plaits' float ChordEngine (chord_ref), same knobs
 (k/127), same f0, 32-sample blocks, after the knobs' one-pole has settled (0.5 s): the difference's level under
-the reference's RMS, OUT and AUX.  usage: compare.py [--quick] [--wavetable | --va] [--float]"""
+the reference's RMS, OUT and AUX.  usage: compare.py [--quick] [--wavetable | --va | --modal | --string] [--float]"""
 import ctypes, itertools, pathlib, subprocess, sys, tempfile
 import numpy as np
 HERE = pathlib.Path(__file__).resolve().parent
@@ -10,27 +10,34 @@ N = 48000
 FALLBACK, CRASH = [], []
 WT = "--wavetable" in sys.argv                                   # WAVETABLE instead of CHORD
 VA = "--va" in sys.argv                                          # VA instead of CHORD
-SEL, MASK = ("MACRO_WAVETABLE", "0x400") if WT else ("MACRO_VA", "0x800") if VA else ("MACRO_CHORD", "0x100")
-REF = ("wt_ref" if WT else "va_ref" if VA else "chord_ref") + ("" if "--float" in sys.argv else "_d")   # default: Plaits in double
+MODAL = "--modal" in sys.argv                                    # MODAL: a trig at 0 and at the half, compared after it
+STRING = "--string" in sys.argv                                  # STRING: the same
+SEL, MASK = (("MACRO_WAVETABLE", "0x400") if WT else ("MACRO_VA", "0x800") if VA else ("MACRO_MODAL", "0x1000") if MODAL
+             else ("MACRO_STRING", "0x2000") if STRING else ("MACRO_CHORD", "0x100"))
+EVERY = N // 64 if MODAL or STRING else 1 << 30                  # blocks between trigs
+REF = ("wt_ref" if WT else "va_ref" if VA else "modal_ref" if MODAL else "string_ref" if STRING else "chord_ref") + ("" if "--float" in sys.argv else "_d")   # default: Plaits in double
 lib = pathlib.Path(tempfile.mkdtemp()) / "m.so"
-subprocess.run(["cc", "-O2", "-w", "-shared", "-fPIC", "-DMACRO_SEL=" + SEL, "-DMACRO_MASK=" + MASK, "-DCHORD_BLOCK=32", "-DCHORD_FROM_ZERO", "-DWT_BLOCK=32", "-DWT_FROM_ZERO",
+subprocess.run(["cc", "-O2", "-w", "-shared", "-fPIC", "-DMACRO_SEL=" + SEL, "-DMACRO_MASK=" + MASK, "-DCHORD_BLOCK=32", "-DCHORD_FROM_ZERO", "-DWT_BLOCK=32", "-DWT_FROM_ZERO", "-DMODAL_BLOCK=32", "-DMODAL_FROM_ZERO",
                 str(SRC / "macro.c"), "-o", str(lib)], check=True)
 m = ctypes.CDLL(str(lib))
 m.macro_render.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_int16), ctypes.c_int]
 
 def ours(inc, h, t, mo, aux):
-    v = ctypes.create_string_buffer(4096)
+    v = ctypes.create_string_buffer(65536)
     m.macro_init(v)
+    ctypes.memmove(ctypes.addressof(v) + 4, (0x21).to_bytes(4, "little"), 4)   # the random numbers as Plaits' start
     buf = (ctypes.c_int16 * 32)()
     out = np.empty(N, np.int64)
     for b in range(0, N, 32):
+        if (b // 32) % EVERY == 0:
+            m.macro_trig(v)
         m.macro_render(v, bytes([4, h, t, mo, aux, 0, 0]), inc, buf, 32)
         out[b:b + 32] = buf[:]
     return out
 
 def ref(note, h, t, mo):
     k16 = lambda k: repr(((k * 33026) >> 6) / 65536)      # exactly the knob value the port uses
-    r = subprocess.run([str(HERE / REF), str(note), k16(h), k16(t), k16(mo), str(N)], capture_output=True)
+    r = subprocess.run([str(HERE / REF), str(note), k16(h), k16(t), k16(mo), str(N)] + ([str(EVERY)] if MODAL or STRING else []), capture_output=True)
     if r.returncode:            # double Plaits reaching a grid position of exactly 7.0 reads past its wave bank
         r = subprocess.run([str(HERE / REF.replace("_d", "")), str(note), k16(h), k16(t), k16(mo), str(N)],
                            capture_output=True)

@@ -18,6 +18,12 @@
 - **2026-10-08** VA (virtual analog, Plaits' two-oscillator engine) ported and checked against Plaits. It replaces
   NOISE in the default set. Emulation: exact against the PC build on the ColdFire, 5.8 % CPU.
 
+- **2026-10-08** MODAL (24-mode resonator) and STRING (three Karplus-Strong strings with dispersion or a curved bridge)
+  ported and checked against Plaits. Both added to the default set, now ten engines. MODAL needed its filter
+  coefficients in 31-bit mantissa and exponent form (Q up to tens of thousands) and a hand-written EMAC loop.
+- **2026-10-08** MACRO's limiter (shared by NOISE, PARTICLE, SWARM, MODAL, STRING) rewritten: its peak was too coarse,
+  so it released 15 % too fast.
+
 ## Tested on hardware
 
 | Build | Device | Result |
@@ -25,12 +31,13 @@
 | Model-TG + Plaits Sampler mode (8 engines) | Model:Samples | installs and boots; sound not yet reported |
 | Model-TG + PLAITS machine + 6ch USB | | not yet installed |
 | Model-TG + PLAITS machine (VA instead of NOISE) + 6ch USB | | not yet installed |
+| Model-TG + PLAITS machine (10 engines, with MODAL and STRING) + 6ch USB | | not yet installed |
 
 ## Next
 
 - Install the PLAITS machine build on the Model:Samples and report what works.
 - Engine names on the SHAPE value instead of numbers.
 - AUX output on a knob (or a setting).
-- Modal resonator and inharmonic string (in progress), then 6-op FM.
+- 6-op FM (DX7 patches): in progress.
 - SPEECH: three speech synthesisers and the LPC word banks, the largest engine left.
 - Offer the PLAITS machine to Modded-Cycles as a pull request.

@@ -14,7 +14,9 @@ SRCS="$ER/plaits/resources.cc $ER/stmlib/dsp/units.cc $ER/stmlib/utils/random.cc
 c++ -O2 -DTEST -w -I$ER chord_ref.cc $ER/plaits/dsp/engine/chord_engine.cc $ER/plaits/dsp/chords/chord_bank.cc $SRCS -o chord_ref
 c++ -O2 -DTEST -w -include dbl.h -I$ER chord_ref.cc $ER/plaits/dsp/engine/chord_engine.cc $ER/plaits/dsp/chords/chord_bank.cc $SRCS -o chord_ref_d
 # same for swarm_ref.cc (engine/swarm_engine.cc), wt_ref.cc (engine/wavetable_engine.cc)
-# and va_ref.cc (engine/virtual_analog_engine.cc)
+# va_ref.cc (engine/virtual_analog_engine.cc), modal_ref.cc (engine/modal_engine.cc,
+# physical_modelling/modal_voice.cc, resonator.cc) and string_ref.cc (engine/string_engine.cc,
+# physical_modelling/string_voice.cc, string.cc)
 ```
 
 ## Comparisons
@@ -23,6 +25,8 @@ c++ -O2 -DTEST -w -include dbl.h -I$ER chord_ref.cc $ER/plaits/dsp/engine/chord_
 python3 compare.py                 # CHORDS, 8,464 cases
 python3 compare.py --wavetable     # WAVETABLE, 8,736 cases
 python3 compare.py --va            # VA, 8,736 cases
+python3 compare.py --modal         # MODAL, 8,736 cases: a trig at 0 and at 0.5 s, compared after the second
+python3 compare.py --string        # STRING, the same
 python3 swarm_compare.py           # SWARM, 2,100 cases, by band levels
 ```
 

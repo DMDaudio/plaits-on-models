@@ -33,8 +33,8 @@
  * The filters multiply on the ColdFire's EMAC: signed fractional, truncating (MACSR 0x20), ACC0 only. Two
  * 32-bit products summed come out as (floor(a x / 2^23) + floor(b y / 2^23)) >> 8, which a PC build
  * computes in 64-bit C (the tests compare the two). A third product, 2^15 x 2^15, adds half the last bit:
- * rounded, not truncated (truncation's bias builds up in a resonant filter's states). macro_render() saves MACSR, ACC0 and ACCEXT01 and puts
- * them back, as Digi EQ does: the firmware's own audio code uses the unit. */
+ * rounded, not truncated (truncation's bias builds up in a resonant filter's states). macro_render() saves MACSR, ACC0, ACC1
+ * (MODAL's filters use it too) and ACCEXT01 and puts them back, as Digi EQ does: the firmware's own audio code uses the unit. */
 #if defined(__mcoldfire__)
 static inline int32_t fmac2(int32_t a, int32_t x, int32_t b, int32_t y)        /* (a x + b y) / 2^31, rounded */
 {
@@ -56,18 +56,18 @@ static inline int32_t fmac1t(int32_t a, int32_t x)                             /
     __asm__ volatile ("mac.l %1,%2,%%acc0\n\tmovclr.l %%acc0,%0" : "=d"(r) : "r"(a), "r"(x));
     return r;
 }
-struct emac_save { int32_t macsr, acc0, ext01; };
+struct emac_save { int32_t macsr, acc0, acc1, ext01; };
 static inline void emac_enter(struct emac_save *e)
 {
     int32_t z = 0;
-    __asm__ volatile ("move.l %%macsr,%0\n\tmove.l %%acc0,%1\n\tmove.l %%accext01,%2\n\t"
-                      "move.l #0x20,%%macsr\n\tmove.l %3,%%acc0\n\tmove.l %3,%%accext01"
-                      : "=&d"(e->macsr), "=&d"(e->acc0), "=&d"(e->ext01) : "d"(z));
+    __asm__ volatile ("move.l %%macsr,%0\n\tmove.l %%acc0,%1\n\tmove.l %%acc1,%2\n\tmove.l %%accext01,%3\n\t"
+                      "move.l #0x20,%%macsr\n\tmove.l %4,%%acc0\n\tmove.l %4,%%acc1\n\tmove.l %4,%%accext01"
+                      : "=&d"(e->macsr), "=&d"(e->acc0), "=&d"(e->acc1), "=&d"(e->ext01) : "d"(z));
 }
 static inline void emac_leave(const struct emac_save *e)
 {
-    __asm__ volatile ("move.l %0,%%acc0\n\tmove.l %1,%%accext01\n\tmove.l %2,%%macsr"
-                      : : "d"(e->acc0), "d"(e->ext01), "d"(e->macsr));
+    __asm__ volatile ("move.l %0,%%acc0\n\tmove.l %1,%%acc1\n\tmove.l %2,%%accext01\n\tmove.l %3,%%macsr"
+                      : : "d"(e->acc0), "d"(e->acc1), "d"(e->ext01), "d"(e->macsr));
 }
 #else
 static inline int32_t fmac2(int32_t a, int32_t x, int32_t b, int32_t y)
@@ -372,32 +372,24 @@ static void svf_guard(struct macro_svf *f)
 
 /* stmlib's Limiter (as Plaits' voice applies it to the engines registered with a negative gain): a peak
  * follower (attack 0.05, release 0.00002 a sample) and 1/peak above 1. x: Q17 in, Q15 out (the 0.8 after
- * it is in the machine's gain). */
+ * it is in the machine's gain). The peak is Q24: in Q17 the release step rounded to 15 % too fast. */
 static void limit(int32_t *peak, int32_t *x, int n)
 {
-    int32_t pk = *peak, rp = 0, i;
-    if (pk > (1 << 17))
-        rp = (int32_t)(0x40000000u / (uint32_t)(pk >> 2));         /* 1/peak, Q15 */
+    int32_t pk = *peak, i;
     for (i = 0; i < n; i++) {
         int32_t s = x[i], err;
         if (s > (31 << 17))
             s = 31 << 17;
         if (s < -(31 << 17))
             s = -(31 << 17);
-        err = iabs(s) - pk;
-        if (err > 0) {                                          /* attack: 1/peak anew */
-            pk += ((err >> 6) * 1638) >> 9;
-            if (pk > (1 << 17))
-                rp = (int32_t)(0x40000000u / (uint32_t)(pk >> 2));
-        } else {                                                /* release: one Newton step keeps 1/peak */
-            pk += ((err >> 6) * 21475) >> 24;
-            if (pk > (1 << 17))
-                rp = (rp * (65536 - (((pk >> 2) * rp) >> 15))) >> 15;
-        }
-        if (pk <= (1 << 17))
+        err = (iabs(s) << 7) - pk;
+        pk += fmac1(err, err > 0 ? 107374182 : 42950);         /* SLOPE(peak, |s|, 0.05, 0.00002) */
+        if (pk <= (1 << 24))
             s >>= 2;
-        else
-            s = ((s >> 6) * rp) >> 11;
+        else {                                                  /* s / peak: 1/peak Q31 (below 1), Q17 -> Q15 */
+            uint32_t rp = 0x80000000u / (uint32_t)(pk >> 8);
+            s = fmac1(s, rp >= 32768 ? 0x7fffffff : (int32_t)(rp << 16)) >> 2;
+        }
         x[i] = s > 65535 ? 65535 : s < -65535 ? -65535 : s;     /* (clipped later; keeps the gain in range) */
     }
     *peak = pk;
@@ -3162,7 +3154,7 @@ static void va_render(struct macro_va *__restrict v, const uint8_t *p, uint32_t 
     sq = (int32_t)((((uint32_t)sq * (uint32_t)sq) >> 16) * (uint32_t)(196608 - 2 * sq) >> 16);
     det = (iv[di] + fmac1(iv[di + 1] - iv[di], sq >= 65536 ? 0x7fffffff : sq << 15)) * sign;
     aux_f = va_freq(inc, det);
-    sync_amount = (timb * timb) >> 16;
+    sync_amount = (int32_t)(((uint32_t)timb * (uint32_t)timb) >> 16);
     shape = (morph * 3) >> 1;
     shape = shape > 65535 ? 65535 : shape;
     pw = (1 << 30) + ((((morph - 43254) * 47841) >> 16) << 16);   /* 0.5 + (MORPH - 0.66) 1.46, Q31 */
@@ -3206,22 +3198,605 @@ static void va_render(struct macro_va *__restrict v, const uint8_t *p, uint32_t 
     }
 }
 
+/* ---- MODAL (Model-TG): plaits/dsp/engine/modal_engine.cc, physical_modelling/modal_voice.cc, resonator.cc ---------- *
+ * A struck resonator: 24 band-pass modes, their spacing set by HARMONICS (stiffness: from bell-like through the
+ * harmonic series to stretched), excited on each trig by a click filtered by TIMBRE (brightness); MORPH is the
+ * damping. OUT: the modes (Plaits limits it); AUX: the click. The modes' Q goes into the tens of thousands, where the
+ * Q23 denominator of svf_coefs_g cannot tell the damping apart, so their coefficients are worked out with a 32-bit
+ * mantissa and an exponent (struct uf), and the filters run in svf_hq's form of the same trapezoidal SVF. */
+
+#ifndef MODAL_BLOCK
+#define MODAL_BLOCK 12
+#endif
+#define MODAL_LP_NEW (-1)
+
+/* x = m 2^(e - 30), m in [2^30, 2^31), or m = 0 for 0: 31-bit mantissas, so a product is one fmac1 on the EMAC */
+struct uf { int32_t m, e; };
+
+static inline struct uf uf_q(uint32_t v, int32_t q)               /* v / 2^q */
+{
+    struct uf r;
+    int z;
+    if (!v) {
+        r.m = 0;
+        r.e = -128;
+        return r;
+    }
+    z = clz32(v);
+    if (z) {
+        r.m = (int32_t)(v << (z - 1));
+        r.e = 31 - z - q;
+    } else {
+        r.m = (int32_t)(v >> 1);
+        r.e = 31 - q;
+    }
+    return r;
+}
+
+static inline struct uf uf_mul(struct uf a, struct uf b)
+{
+    struct uf r;
+    int32_t p;
+    if (!a.m || !b.m)
+        return uf_q(0, 0);
+    p = fmac1(a.m, b.m);                                            /* [2^29, 2^31) */
+    if (p & 0x40000000) {
+        r.m = p;
+        r.e = a.e + b.e + 1;
+    } else {
+        r.m = p << 1;
+        r.e = a.e + b.e;
+    }
+    return r;
+}
+
+static inline struct uf uf_add(struct uf a, struct uf b)            /* a, b >= 0 */
+{
+    int32_t d;
+    uint32_t s;
+    if (!b.m)
+        return a;
+    if (!a.m)
+        return b;
+    if (a.e < b.e) {
+        struct uf t = a;
+        a = b;
+        b = t;
+    }
+    d = a.e - b.e;
+    s = (uint32_t)a.m + (d > 30 ? 0 : (uint32_t)b.m >> d);
+    if (s & 0x80000000u) {
+        a.m = (int32_t)(s >> 1);
+        a.e++;
+    } else
+        a.m = (int32_t)s;
+    return a;
+}
+
+/* 1 / a: a 16-bit quotient, then two Newton steps */
+static struct uf uf_recip(struct uf a)
+{
+    struct uf o;
+    int32_t r, d, k;
+    o.e = -a.e - 1;
+    if (a.m == 0x40000000) {
+        o.m = a.m;
+        o.e = -a.e;
+        return o;
+    }
+    r = (int32_t)((0x40000000u / (uint32_t)(a.m >> 15)) << 16);     /* 2^61 / m, in (2^30, 2^31) */
+    if (r <= 0)
+        r = 0x7fffffff;
+    for (k = 0; k < 2; k++) {
+        d = 0x40000000 - fmac1(a.m, r);                             /* (1 - m r / 2^61) 2^30 */
+        r += fmac1(r, d << 1);
+        if (r <= 0)
+            r = 0x7fffffff;
+    }
+    o.m = r;
+    return o;
+}
+
+static inline uint32_t uf_to(struct uf a, int32_t q)               /* a 2^q, saturated */
+{
+    int32_t sh = a.e - 30 + q;
+    if (!a.m)
+        return 0;
+    if (sh > 1)
+        return 0xffffffffu;
+    if (sh == 1)
+        return (uint32_t)a.m << 1;
+    return sh < -31 ? 0 : (uint32_t)a.m >> -sh;
+}
+
+/* 2^(semitones / 12), semitones Q16, floored to 1/256 semitone as SemitonesToRatio reads its tables */
+static struct uf uf_semis(int32_t semis)
+{
+    int32_t q = semis >> 8, oct = (q + 3072 * 16) / 3072 - 16, r = q - oct * 3072;
+    struct uf x = uf_q(mulhi(pitch_semi[r >> 8], pitch_fine[r & 255]), 30);
+    x.e += oct;
+    return x;
+}
+
+/* OnePole::tan<FREQUENCY_FAST>: f (pi + f^2 (a + b f^2)), f a phase increment up to 0.499 (below 2^31) */
+static struct uf tan_fast(uint32_t finc)
+{
+    int32_t f2 = fmac1((int32_t)finc, (int32_t)finc) >> 1;          /* Q32, up to 0.25 */
+    int32_t p = 678339520 + fmac1(f2, 1871914112);            /* a + b f^2, Q26 */
+    p = 421657428 + fmac1(f2, p);                       /* Q27 */
+    return uf_mul(uf_q(finc, 32), uf_q((uint32_t)p, 27));
+}
+
+/* a trapezoidal SVF's a1 = 1 / D, a2 = g / D, a3 = g^2 / D, D = 1 + g (g + 1/q), as q / (q (1 + g^2) + g) */
+static void svf_hq(struct svf_c *c, struct uf g, struct uf q)
+{
+    const struct uf one = {0x40000000, 0};
+    struct uf a1, a2, a3;
+    uint32_t v;
+    a1 = uf_mul(q, uf_recip(uf_add(uf_mul(q, uf_add(one, uf_mul(g, g))), g)));
+    a2 = uf_mul(g, a1);
+    a3 = uf_mul(g, a2);
+    v = uf_to(a1, 31);
+    c->a1 = v > 0x7fffffffu ? 0x7fffffff : (int32_t)v;
+    v = uf_to(a2, 31);
+    c->a2 = v > 0x7fffffffu ? 0x7fffffff : (int32_t)v;
+    v = uf_to(a3, 31);
+    c->a3 = v > 0x7fffffffu ? 0x7fffffff : (int32_t)v;
+    c->k2 = 0;
+}
+
+static const int32_t modal_stiffness[65] = {                       /* lut_stiffness, Q24 */
+    -1048576, -983040, -917504, -851968, -786432, -720896, -655360, -589824,
+    -524288, -458752, -393216, -327680, -262144, -196608, -131072, -65536,
+    0, 0, 0, 0, 16938, 40535, 67147, 97158,
+    131003, 169172, 212218, 260762, 315508, 377248, 446875, 525398,
+    613951, 713818, 826443, 953456, 1096695, 1258232, 1440407, 1645855,
+    1877549, 2138843, 2433517, 2765837, 3140610, 3563262, 4039909, 4577448,
+    5183658, 5867313, 6638307, 7507796, 8488364, 9594201, 10841311, 12247741,
+    13833846, 15622578, 16777848, 16871825, 17582612, 19864067, 24446104, 33554432,
+    33554432,
+};
+static const int32_t modal_amp[MACRO_MODAL_MODES] = {               /* Resonator::Init(0.015): cosine x 0.25, Q31 */
+    536870912, 535904512, 533012352, 528215168, 521547521, 513057472,
+    502806079, 490867199, 477326785, 462282304, 445842112, 428124608,
+    409257280, 389376031, 368623999, 347150593, 325110431, 302662207,
+    279967553, 257189855, 234493120, 212040784, 189994496, 168513008,
+};
+
+/* one mode over the block: SVF_STEP, its band-pass x gain added into out. On the ColdFire, by hand: the two
+ * sums on ACC0 and ACC1 side by side, the same products and rounding as fmac2 / fmac1 (so the same samples). */
+static inline void modal_mode(struct macro_svf *f, const int32_t *mc, const int32_t *in, int32_t *out, int n)
+{
+    int32_t s1 = f->s1, s2 = f->s2;
+#if defined(__mcoldfire__)
+    int32_t v3, bp, lp, h = 32768, cnt = n;
+    __asm__ volatile ("1:\n\t"
+                      "move.l (%[in])+,%[v3]\n\t"
+                      "sub.l %[s2],%[v3]\n\t"
+                      "mac.l %[a1],%[s1],%%acc0\n\t"
+                      "mac.l %[a2],%[s1],%%acc1\n\t"
+                      "mac.l %[a2],%[v3],%%acc0\n\t"
+                      "mac.l %[a3],%[v3],%%acc1\n\t"
+                      "mac.l %[h],%[h],%%acc0\n\t"
+                      "mac.l %[h],%[h],%%acc1\n\t"
+                      "movclr.l %%acc0,%[bp]\n\t"
+                      "movclr.l %%acc1,%[lp]\n\t"
+                      "mac.l %[g],%[bp],%%acc0\n\t"
+                      "add.l %[s2],%[lp]\n\t"
+                      "neg.l %[s1]\n\t"
+                      "add.l %[bp],%[s1]\n\t"
+                      "add.l %[bp],%[s1]\n\t"
+                      "neg.l %[s2]\n\t"
+                      "add.l %[lp],%[s2]\n\t"
+                      "add.l %[lp],%[s2]\n\t"
+                      "mac.l %[h],%[h],%%acc0\n\t"
+                      "movclr.l %%acc0,%[v3]\n\t"
+                      "add.l %[v3],(%[out])+\n\t"
+                      "subq.l #1,%[cnt]\n\t"
+                      "bne.s 1b"
+                      : [s1] "+d"(s1), [s2] "+d"(s2), [v3] "=&d"(v3), [bp] "=&d"(bp), [lp] "=&d"(lp), [cnt] "+d"(cnt),
+                        [in] "+a"(in), [out] "+a"(out)
+                      : [a1] "a"(mc[0]), [a2] "a"(mc[1]), [a3] "a"(mc[2]), [g] "a"(mc[3]), [h] "d"(h)
+                      : "cc", "memory");
+#else
+    int32_t a1 = mc[0], a2 = mc[1], a3 = mc[2], gain = mc[3], i;
+    for (i = 0; i < n; i++) {
+        int32_t v3 = in[i] - s2, bp = fmac2(a1, s1, a2, v3), lp = s2 + fmac2(a2, s1, a3, v3);
+        s1 = bp + bp - s1;
+        s2 = lp + lp - s2;
+        out[i] += fmac1(gain, bp);
+    }
+#endif
+    f->s1 = s1;
+    f->s2 = s2;
+}
+
+static COLD void modal_init(struct macro_modal *md)
+{
+    int32_t *w = (int32_t *)md, *end = (int32_t *)(md + 1);
+    while (w < end)
+        *w++ = 0;
+#ifndef MODAL_FROM_ZERO
+    md->harm_lp = MODAL_LP_NEW;
+#endif
+}
+
+static void modal_render(struct macro_modal *__restrict md, const uint8_t *p, uint32_t inc, int32_t *__restrict out,
+                         int32_t *__restrict aux, int n)
+{
+    const struct uf one = {0x40000000, 0};
+    int32_t harm = k16(p[MACRO_P_HARM]), timb = k16(p[MACRO_P_TIMB]), morph = k16(p[MACRO_P_MORPH]);
+    int32_t cp, s, st, sf, stiff, bright, damp, bb, b2, i, k, exc[32];
+    uint32_t cut, mf;
+    struct uf f0, harmonic, q, qloss, mq;
+    struct svf_c c;
+    /* ONE_POLE(harmonics_lp_, HARMONICS, 0.01) once a 12-sample block: 1 - 0.99^(n / 12) */
+    cp = n == MODAL_BLOCK ? 21474836 : (65536 - (int32_t)exp2_q16(-950 * n / MODAL_BLOCK)) << 15;   /* Q31 */
+    if (md->harm_lp == MODAL_LP_NEW)
+        md->harm_lp = harm << 8;
+    {                                                             /* rounded, and onto the target at the end */
+        int32_t d = (harm << 8) - md->harm_lp, step = fmac1(d, cp);
+        md->harm_lp = step ? md->harm_lp + step : harm << 8;
+    }
+    s = (md->harm_lp + 128) >> 8;                                 /* structure, Q16 */
+    /* ModalVoice: accent 0.8 */
+    bright = timb + (65536 - timb) / 5;
+    damp = morph + (65536 - morph) / 5;
+    bright = bright > 65535 ? 65535 : bright;
+    damp = damp > 65535 ? 65535 : damp;
+    bb = (int32_t)(((uint32_t)bright * (uint32_t)(131072 - bright)) >> 16);
+    cut = va_freq(inc << 1, (bb - 32768) * 60);
+    cut = cut > 2143188679u ? 2143188679u : cut;                     /* 0.499 */
+    /* the click, through ResonatorSvf<1> (low-pass, q 1.5) */
+    if (cut != (uint32_t)md->key_cut) {
+        md->key_cut = (int32_t)cut;
+        svf_hq(&c, tan_fast(cut), uf_q(3, 1));
+        md->exc_c[0] = c.a1;
+        md->exc_c[1] = c.a2;
+        md->exc_c[2] = c.a3;
+    }
+    c.a1 = md->exc_c[0];
+    c.a2 = md->exc_c[1];
+    c.a3 = md->exc_c[2];
+    {
+        struct macro_svf f = md->exc;
+        int32_t bp, lp;
+        i = 0;
+        if (md->trig) {                                            /* (0.12 + 0.08 accent) (1 - damping / 2) 2^(24 c^2) / c */
+            int32_t imp, v3;
+            struct uf a = uf_mul(uf_q((uint32_t)(65536 - (damp >> 1)), 16), uf_q(395136630u, 31));   /* 0.184 */
+            a = uf_mul(uf_mul(a, uf_semis((int32_t)(mulhi(cut, cut) >> 16) * 24)), uf_recip(uf_q(cut, 32)));
+            imp = (int32_t)uf_to(a, 18);                            /* Q18 */
+            imp = imp < 0 ? 0x7fffffff : imp;
+            v3 = imp - (f.s2 >> 6);
+            bp = fmac1(c.a1, f.s1) + (fmac1(c.a2, v3) << 6);
+            lp = f.s2 + fmac1(c.a2, f.s1) + (fmac1(c.a3, v3) << 6);
+            f.s1 = bp + bp - f.s1;
+            f.s2 = lp + lp - f.s2;
+            exc[0] = lp;
+            i = 1;
+            md->trig = 0;
+        }
+        for (; i < n; i++) {
+            SVF_STEP(f, c, 0, bp, lp);
+            exc[i] = lp;
+        }
+        md->exc = f;
+    }
+    for (i = 0; i < n; i++) {
+        aux[i] = (exc[i] + 256) >> 9;                               /* Q15 */
+        out[i] = 0;
+    }
+    /* the modes' coefficients: worked out again only when the pitch or a knob has moved */
+    if (inc != md->key[0] || s != md->key[1] || bright != md->key[2] || damp != md->key[3]) {
+        md->key[0] = inc;
+        md->key[1] = s;
+        md->key[2] = bright;
+        md->key[3] = damp;
+        /* Resonator::Process */
+        st = (s >> 10) > 63 ? 63 : s >> 10;
+        stiff = modal_stiffness[st] + fmac1(modal_stiffness[st + 1] - modal_stiffness[st], (s & 1023) << 21);
+        sf = (1 << 24) + stiff + fmac1(stiff, stiff < 0 ? 1997159793 : 2104533975);   /* NthHarmonicCompensation(3) */
+        f0 = uf_mul(uf_q(inc, 32), uf_recip(uf_q((uint32_t)sf, 24)));
+        harmonic = f0;
+        q = uf_semis(damp * 79 + (int32_t)(((uint32_t)damp * 45875u) >> 16));              /* q_sqrt = 2^(79.7 damping / 12) */
+        q = uf_mul(uf_mul(q, q), uf_q(500, 0));
+        b2 = (int32_t)(((uint32_t)bright * (uint32_t)(65536 - ((s * 19661) >> 16))) >> 16);   /* x (1 - 0.3 structure) */
+        b2 = (int32_t)(((uint32_t)b2 * (uint32_t)(65536 - ((damp * 19661) >> 16))) >> 16);   /* x (1 - 0.3 damping) */
+        qloss = uf_q(((((uint32_t)b2 * (uint32_t)(131072 - b2)) >> 16) * 55706u >> 16) + 9830, 16);   /* b (2 - b) 0.85 + 0.15 */
+        sf = 1 << 24;
+        for (k = 0; k < MACRO_MODAL_MODES; k++) {
+            struct uf mfu = uf_mul(harmonic, uf_q((uint32_t)sf, 24));
+            int32_t *mc = md->coef[k];
+            mf = uf_to(mfu, 32);
+            if (mf > 2143188679u) {
+                mf = 2143188679u;
+                mfu = uf_q(mf, 32);
+            }
+            mq = uf_add(one, uf_mul(mfu, q));
+            svf_hq(&c, tan_fast(mf), mq);
+            mc[0] = c.a1;
+            mc[1] = c.a2;
+            mc[2] = c.a3;
+            mc[3] = fmac1(modal_amp[k], (int32_t)(0x80000000u - mf));     /* gain x (1 - 2 f) */
+            sf += stiff;
+            stiff = fmac1(stiff, stiff < 0 ? 1997159793 : 2104533975);   /* x 0.93, x 0.98 */
+            harmonic = uf_add(harmonic, f0);
+            q = uf_mul(q, qloss);
+        }
+    }
+    for (k = 0; k < MACRO_MODAL_MODES; k++)
+        modal_mode(&md->mode[k], md->coef[k], exc, out, n);
+    for (i = 0; i < n; i++)
+        out[i] = (out[i] + 64) >> 7;                                /* Q17, for the limiter */
+}
+
+/* ---- STRING (Model-TG): plaits/dsp/engine/string_engine.cc, physical_modelling/string_voice.cc, string.cc ------ *
+ * Three Karplus-Strong strings in turn (each trig plucks the next, the others ring on): a burst of filtered noise one
+ * period long (TIMBRE: brightness), a delay line with a damping low-pass (MORPH: decay, endless at the top) and, from
+ * HARMONICS, a curved bridge (below the middle) or dispersion through an allpass (above). OUT: the strings (Plaits
+ * limits it); AUX: the bursts. Signals Q24, delays Q20 (samples; up to 2048, as dispersion and the curved bridge stretch them past 1020). */
+
+static const int32_t string_shift[129] = {                         /* lut_svf_shift[0..128], Q31 */
+    1610612736, 1630343906, 1650009481, 1669544948, 1688887922, 1707979097,
+    1726763091, 1745189139, 1763211629, 1780790470, 1797891299, 1814485525,
+    1830550242, 1846068024, 1861026615, 1875418564, 1889240793, 1902494149,
+    1915182937, 1927314462, 1938898579, 1949947278, 1960474287, 1970494717,
+    1980024741, 1989081306, 1997681885, 2005844259, 2013586331, 2020925971,
+    2027880884, 2034468504, 2040705906, 2046609740, 2052196174, 2057480857,
+    2062478892, 2067204814, 2071672582, 2075895575, 2079886593, 2083657863,
+    2087221051, 2090587270, 2093767101, 2096770602, 2099607332, 2102286367,
+    2104816317, 2107205347, 2109461196, 2111591196, 2113602289, 2115501047,
+    2117293690, 2118986101, 2120583846, 2122092186, 2123516097, 2124860281,
+    2126129183, 2127327001, 2128457705, 2129525044, 2130532557, 2131483591,
+    2132381305, 2133228681, 2134028538, 2134783536, 2135496188, 2136168866,
+    2136803810, 2137403133, 2137968834, 2138502796, 2139006799, 2139482524,
+    2139931555, 2140355389, 2140755441, 2141133044, 2141489457, 2141825870,
+    2142143403, 2142443117, 2142726011, 2142993028, 2143245061, 2143482949,
+    2143707486, 2143919422, 2144119463, 2144308278, 2144486495, 2144654710,
+    2144813485, 2144963348, 2145104800, 2145238314, 2145364334, 2145483281,
+    2145595553, 2145701523, 2145801545, 2145895954, 2145985064, 2146069173,
+    2146148561, 2146223494, 2146294221, 2146360978, 2146423989, 2146483462,
+    2146539599, 2146592584, 2146642595, 2146689800, 2146734355, 2146776410,
+    2146816104, 2146853570, 2146888934, 2146922313, 2146953818, 2146983555,
+    2147011623, 2147038116, 2147063122,
+};
+
+/* OnePole::tan<FREQUENCY_DIRTY>: f (pi + a f^2) */
+static struct uf tan_dirty_uf(uint32_t finc)
+{
+    int32_t f2 = fmac1((int32_t)finc, (int32_t)finc) >> 1;          /* Q32 */
+    int32_t p = 421657428 + fmac1(f2, 777385408);           /* Q27 */
+    return uf_mul(uf_q(finc, 32), uf_q((uint32_t)p, 27));
+}
+
+static void svf_store(int32_t *c3, struct uf g, struct uf q)
+{
+    struct svf_c c;
+    svf_hq(&c, g, q);
+    c3[0] = c.a1;
+    c3[1] = c.a2;
+    c3[2] = c.a3;
+}
+
+static COLD void string_init(struct macro_string *st)
+{
+    int32_t *w = (int32_t *)st, *end = (int32_t *)(st + 1), i;
+    while (w < end)
+        *w++ = 0;
+    st->active = MACRO_STRINGS - 1;
+    for (i = 0; i < MACRO_STRINGS; i++) {
+        st->s[i].f0 = 42949673u;                                    /* f0_ 0.01 */
+        st->s[i].delay = 100 << 20;                                 /* delay_ 100 */
+    }
+}
+
+/* the delay line read between taps (Read), and with Hermite interpolation (ReadHermite); d Q20 */
+static inline int32_t dl_read(const int32_t *line, int32_t wp, int32_t d)
+{
+    int32_t i = d >> 20, a = line[(wp + i) & 1023], b = line[(wp + i + 1) & 1023];
+    return a + fmac1(b - a, (d & 0xfffff) << 11);
+}
+
+static inline int32_t dl_hermite(const int32_t *line, int32_t wp, int32_t d)
+{
+    int32_t t = wp + (d >> 20) + 1024, f = (d & 0xfffff) << 11;
+    int32_t xm1 = line[(t - 1) & 1023], x0 = line[t & 1023], x1 = line[(t + 1) & 1023], x2 = line[(t + 2) & 1023];
+    int32_t c = (x1 - xm1) >> 1, v = x0 - x1, w = c + v, a = w + v + ((x2 - x0) >> 1), bn = w + a;
+    return fmac1(fmac1(fmac1(a, f) - bn, f) + c, f) + x0;
+}
+
+/* one string over the block: StringVoice::Render (no sustain) and String::Process */
+static void string_one(struct macro_strv *__restrict v, uint32_t *rng, int trig, int32_t structure, int32_t b30,
+                       int32_t damp, int32_t *__restrict out, int32_t *__restrict aux, int n)
+{
+    int32_t tmp[32], i, nl, curved, dc, ratio, delay, target, comp, sp, sc, na, nf, bc, apg, dinc, bb, bright, d30;
+    int32_t wp = v->wp, steps = 0;
+    uint32_t inc = v->f0, df, phase;
+    struct macro_svf ef = v->exc, lf = v->damp;
+    struct svf_c c;
+    /* accent 0.8: brightness (TIMBRE^2) and damping in Q30, then Q16 for what needs no more */
+    b30 += (0x40000000 - b30) / 5;
+    d30 = (damp << 14) + (0x40000000 - (damp << 14)) / 5;
+    bright = b30 >> 14;
+    damp = d30 >> 14;
+    if (trig) {                                                     /* the burst: one period of noise, filtered */
+        uint32_t cut;
+        bb = (int32_t)(((uint32_t)bright * (uint32_t)(131072 - bright)) >> 16);
+        cut = va_freq(inc, (bb - 32768) * 72 + (24 << 16));        /* 4 f0 2^((b (2 - b) - 0.5) 72 / 12) */
+        cut = cut > 2143188679u ? 2143188679u : cut;
+        svf_store(v->exc_c, tan_dirty_uf(cut), uf_q(1, 1));
+        v->remaining = (int32_t)uf_to(uf_recip(uf_q(inc, 32)), 0);
+    }
+    for (i = 0; i < n; i++)
+        tmp[i] = 0;
+    for (i = 0; i < n && v->remaining > 0; i++, v->remaining--)
+        tmp[i] = (int32_t)(rnd32(rng) - 0x80000000u) >> 7;          /* 2 GetFloat() - 1, Q24 */
+    c.a1 = v->exc_c[0];
+    c.a2 = v->exc_c[1];
+    c.a3 = v->exc_c[2];
+    for (i = 0; i < n; i++) {
+        int32_t bp, lp;
+        SVF_STEP(ef, c, tmp[i], bp, lp);
+        (void)bp;
+        tmp[i] = lp;
+        aux[i] += lp;
+    }
+    v->exc = ef;
+    /* String::Process */
+    {                                                               /* the non-linearity, Q30 */
+        int32_t s30 = structure << 14;
+        if (s30 < 257698038) {                                      /* (s - 0.24) 4.166 */
+            int32_t x = 257698038 - s30;
+            nl = x * 4 + fmac1(x, 356482286);
+            curved = 1;
+        } else if (s30 > 279172874) {                               /* (s - 0.26) 1.35135 */
+            int32_t x = s30 - 279172874;
+            nl = x + fmac1(x, 754518380);
+            curved = 0;
+        } else {
+            nl = 0;
+            curved = 1;
+        }
+        nl = nl > 0x40000000 ? 0x40000000 : nl;
+    }
+    if (!inc)
+        delay = 1020 << 20;
+    else {
+        uint32_t d = uf_to(uf_recip(uf_q(inc, 32)), 20);
+        delay = d < (4u << 20) ? 4 << 20 : d > (1020u << 20) ? 1020 << 20 : (int32_t)d;
+    }
+    ratio = (int32_t)mulhi((uint32_t)delay << 2, inc);              /* delay f0, Q22 */
+    ratio = ratio >= 4193885 ? 1 << 30 : ratio << 8;                /* >= 0.9999: 1 (and the phase at 1), Q30 */
+    phase = ratio == 1 << 30 ? 1u << 30 : v->src_phase;
+    dc = 786432 + (int32_t)((((uint32_t)damp * (uint32_t)damp) >> 16) * 60u) + bright * 24;   /* 12 + 60 d^2 + 24 b, Q16 */
+    dc = dc > 84 << 16 ? 84 << 16 : dc;
+    df = va_freq(inc, dc);
+    df = df > 2143188679u ? 2143188679u : df;
+    if (d30 >= 1020054733) {                                        /* to endless decay, from 0.95 */
+        int32_t t = (d30 - 1020054733) * 40;                        /* 20 (d - 0.95), Q31 */
+        t = t < 0 ? 0x7fffffff : t;
+        b30 += fmac1(0x40000000 - b30, t);
+        bright = b30 >> 14;
+        df += (uint32_t)fmac1((int32_t)(2147054152u - df), t);     /* += t (0.4999 - f) */
+        dc += fmac1((128 << 16) - dc, t);
+    }
+    svf_hq(&c, tan_fast(df), uf_q(1, 1));
+    {
+        int32_t ci = dc >> 16, cf = dc & 0xffff;
+        comp = string_shift[ci] + fmac1(string_shift[ci + 1 > 128 ? 128 : ci + 1] - string_shift[ci], cf << 15);
+    }
+    target = fmac1(delay, comp);
+    dinc = (target - v->delay) / n;
+    sp = fmac1(fmac1(nl, 0x40000000 - (nl >> 1)), 483183821) << 3;   /* nl (2 - nl) 0.225, Q31 */
+    sc = (delay >> 4) / 300;                                        /* 160 / 48000 x delay, Q16 */
+    sc = sc < 65536 ? 65536 : sc > 137626 ? 137626 : sc;
+    na = nl > 805306368 ? (nl - 805306368) * 4 : 0;                /* 4 (nl - 0.75), Q30 */
+    na = fmac1(fmac1(na, na), 214748365) << 2;                      /* 0.1 nas^2, Q31 */
+    nf = fmac1(b30, b30);                                           /* b^2, Q29 */
+    nf = 128849019 + fmac1(nf, 2018634629) * 4;                    /* 0.06 + 0.94 b^2, Q31 */
+    nf = nf < 0 ? 0x7fffffff : nf;
+    bc = fmac1(fmac1(nl, nl), 21474836) << 2;                       /* 0.01 nl^2, Q31 */
+    apg = nl ? -fmac1((int32_t)uf_to(uf_mul(uf_q((uint32_t)nl, 30), uf_recip(uf_q((uint32_t)nl + 161061274u, 30))), 31),
+                     1327144894) : 0;                               /* -0.618 nl / (0.15 + nl), Q31 */
+    for (i = 0; i < n; i++) {
+        phase += (uint32_t)ratio;
+        if (phase > 1u << 30) {
+            int32_t d, s;
+            phase -= 1u << 30;
+            v->delay += dinc;
+            steps++;
+            d = v->delay;
+            if (!curved) {
+                int32_t noise = (int32_t)(rnd32(rng) - 0x80000000u) >> 2;   /* GetFloat() - 0.5, Q30 */
+                v->disp += fmac1(noise - v->disp, nf);
+                d += fmac1(d, fmac1(v->disp << 1, na));
+            } else
+                d -= fmac1(d, fmac1(v->curve, bc) << 7);
+            if (!curved) {
+                int32_t ap = fmac1(d, sp);                    /* delay x stretch_point */
+                int32_t md = d - fmac1(fmac1(ap, 876173886 - fmac1(sp, 661424964)) << 2, sc << 13);
+                if (ap >= 4 << 20 && md >= 4 << 20) {
+                    int32_t r, wv;
+                    s = dl_read(v->line, wp, md);
+                    r = v->stretch[(v->swp + (ap >> 20)) & 255];
+                    wv = s + fmac1(apg, r);
+                    v->stretch[v->swp] = wv;
+                    v->swp = (v->swp - 1) & 255;
+                    s = r - fmac1(wv, apg);
+                } else
+                    s = dl_hermite(v->line, wp, d);
+            } else {
+                int32_t a_, val;
+                s = dl_hermite(v->line, wp, d);
+                a_ = s < 0 ? -s : s;
+                val = a_ - 419430;                                  /* |s| - 0.025 */
+                v->curve = val > 0 ? (s > 0 ? val * 2 : -val * 3) : 0;
+            }
+            s += tmp[i];
+            s = s > 20 << 24 ? 20 << 24 : s < -(20 << 24) ? -(20 << 24) : s;
+            v->dc_y = fmac1(v->dc_y, 2146588863) + s - v->dc_x;     /* DCBlocker, pole 1 - 20 / 48000 */
+            v->dc_x = s;
+            s = v->dc_y;
+            {
+                int32_t bp, lp;
+                SVF_STEP(lf, c, s, bp, lp);
+                (void)bp;
+                s = lp;
+            }
+            v->line[wp] = s;
+            wp = (wp - 1) & 1023;
+            v->out1 = v->out0;
+            v->out0 = s;
+        }
+        out[i] += phase >= 1u << 30 ? v->out0 : v->out1 + fmac1(v->out0 - v->out1, (int32_t)(phase << 1));   /* Crossfade */
+    }
+    if (steps == n)                                                 /* the ramp's end, exactly (as in float) */
+        v->delay = target;
+    v->wp = wp;
+    v->damp = lf;
+    v->src_phase = phase;
+}
+
+static void string_render(struct macro_string *__restrict st, uint32_t *rng, const uint8_t *p, uint32_t inc,
+                          int32_t *__restrict out, int32_t *__restrict aux, int n)
+{
+    int32_t harm = k16(p[MACRO_P_HARM]), timb = k16(p[MACRO_P_TIMB]), morph = k16(p[MACRO_P_MORPH]), i, trig = st->trig;
+    st->trig = 0;
+    if (trig) {                                                     /* the string let go keeps its pitch of 14 blocks ago */
+        st->s[st->active].f0 = st->f0_hist[(st->f0_wp + 14) & 15];
+        st->active = (st->active + 1) % MACRO_STRINGS;
+    }
+    st->s[st->active].f0 = inc;
+    st->f0_hist[st->f0_wp] = inc;
+    st->f0_wp = (st->f0_wp - 1) & 15;
+    for (i = 0; i < n; i++)
+        out[i] = aux[i] = 0;
+    for (i = 0; i < MACRO_STRINGS; i++)
+        string_one(&st->s[i], rng, trig && i == st->active, harm, (int32_t)(((uint32_t)timb * (uint32_t)timb) >> 2), morph,
+                   out, aux, n);
+    for (i = 0; i < n; i++) {
+        out[i] = (out[i] + 64) >> 7;                                /* Q17, for the limiter */
+        aux[i] = (aux[i] + 256) >> 9;                               /* Q15 */
+    }
+}
+
 /* the gains Plaits' voice gives each engine's OUT and AUX (voice.cc, RegisterInstance), Q15. An engine
  * Plaits registers with a negative gain goes through its limiter (limit()) and then 0.8. */
-static const int16_t gain_out[MACRO_ENGINES] = {22938, 19661, 26214, 26214, 26214, 26214, 26214, 22938, 26214, 26214, 19661, 26214};  /* WSH .7, FM .6, NOISE, PART lim; drums .8; GRAIN .7 */
-static const int16_t gain_aux[MACRO_ENGINES] = {19661, 19661, 26214, 32767, 26214, 26214, 26214, 19661, 26214, 32767, 19661, 26214};  /* WSH .6, FM .6, NOISE lim, PART 1; drums .8; GRAIN .6 */
+static const int16_t gain_out[MACRO_ENGINES] = {22938, 19661, 26214, 26214, 26214, 26214, 26214, 22938, 26214, 26214, 19661, 26214, 26214, 26214};  /* WSH .7, FM .6, NOISE, PART lim; drums .8; GRAIN .7 */
+static const int16_t gain_aux[MACRO_ENGINES] = {19661, 19661, 26214, 32767, 26214, 26214, 26214, 19661, 26214, 32767, 19661, 26214, 26214, 26214};  /* WSH .6, FM .6, NOISE lim, PART 1; drums .8; GRAIN .6 */
 
-const char *const macro_engine_name[MACRO_ENGINES] = {"WSHAPE", "2OP FM", "NOISE", "PARTCL", "BDRUM", "SNARE", "HIHAT", "GRAIN", "CHORDS", "SWARM", "WAVES", "VA"};
+const char *const macro_engine_name[MACRO_ENGINES] = {"WSHAPE", "2OP FM", "NOISE", "PARTCL", "BDRUM", "SNARE", "HIHAT", "GRAIN", "CHORDS", "SWARM", "WAVES", "VA", "MODAL", "STRING"};
 
 /* Model-TG: which engines are built in, and their order on the ENGN knob. MACRO_SEL is a list of MACRO_*
  * ids (build.py --plaits-engines); an engine not in it is never called, so its code and tables are not
  * linked. Knob zone k (8 values each) plays the k-th engine of the list; past the last, the last. */
 #ifndef MACRO_SEL
 #define MACRO_SEL MACRO_WSH, MACRO_FM, MACRO_NOISE, MACRO_PARTICLE, MACRO_BD, MACRO_SD, MACRO_HH, MACRO_GRAIN, \
-                  MACRO_CHORD, MACRO_SWARM, MACRO_WAVETABLE, MACRO_VA
+                  MACRO_CHORD, MACRO_SWARM, MACRO_WAVETABLE, MACRO_VA, MACRO_MODAL, MACRO_STRING
 #endif
 #ifndef MACRO_MASK                     /* bit e set: engine e is in MACRO_SEL (build.py passes both) */
-#define MACRO_MASK 0xfff
+#define MACRO_MASK 0x3fff
 #endif
 static const uint8_t macro_sel[] = { MACRO_SEL };
 #define MACRO_NSEL ((int)sizeof macro_sel)
@@ -3235,7 +3810,7 @@ int macro_engine_of(int b)
 
 static void engine_init(struct macro_voice *m)
 {
-    m->lim_out = m->lim_aux = 1 << 16;                     /* the limiters start at a peak of 0.5 */
+    m->lim_out = m->lim_aux = 1 << 23;                     /* the limiters start at a peak of 0.5 (Q24) */
     switch (m->engine) {
     case MACRO_WSH:   if (HAS(MACRO_WSH)) wsh_init(&m->e.wsh); break;
     case MACRO_FM:    if (HAS(MACRO_FM)) fm_init(&m->e.fm); break;
@@ -3249,6 +3824,8 @@ static void engine_init(struct macro_voice *m)
     case MACRO_SWARM: if (HAS(MACRO_SWARM)) swarm_init(&m->e.swarm); break;
     case MACRO_WAVETABLE: if (HAS(MACRO_WAVETABLE)) wt_init(&m->e.wt); break;
     case MACRO_VA: if (HAS(MACRO_VA)) va_init(&m->e.va); break;
+    case MACRO_MODAL: if (HAS(MACRO_MODAL)) modal_init(&m->e.modal); break;
+    case MACRO_STRING: if (HAS(MACRO_STRING)) string_init(&m->e.string); break;
     default: break;
     }
 }
@@ -3304,6 +3881,10 @@ static void macro_render_e(struct macro_voice *m, const uint8_t *p, uint32_t inc
             m->e.hh.trig = 1;
         if (HAS(MACRO_SWARM) && m->engine == MACRO_SWARM)
             m->e.swarm.trig = 1;
+        if (HAS(MACRO_MODAL) && m->engine == MACRO_MODAL)
+            m->e.modal.trig = 1;
+        if (HAS(MACRO_STRING) && m->engine == MACRO_STRING)
+            m->e.string.trig = 1;
     }
     if (inc > INC_MAX)
         inc = INC_MAX;
@@ -3337,6 +3918,18 @@ static void macro_render_e(struct macro_voice *m, const uint8_t *p, uint32_t inc
     case MACRO_GRAIN:
         if (!HAS(MACRO_GRAIN)) goto none;
         grain_render(&m->e.grain, p, inc, o, a, n, mix < 32767, mix > 0);
+        break;
+    case MACRO_STRING:
+        if (!HAS(MACRO_STRING)) goto none;
+        string_render(&m->e.string, &m->rng, p, inc, o, a, n);
+        if (mix < 32767)
+            limit(&m->lim_out, o, n);
+        break;
+    case MACRO_MODAL:
+        if (!HAS(MACRO_MODAL)) goto none;
+        modal_render(&m->e.modal, p, inc, o, a, n);
+        if (mix < 32767)
+            limit(&m->lim_out, o, n);
         break;
     case MACRO_VA:
         if (!HAS(MACRO_VA)) goto none;

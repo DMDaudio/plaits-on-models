@@ -27,6 +27,13 @@ PARTICLE, BDRUM, SNARE, HIHAT and GRAIN in 32-bit integer C, checked against Pla
   variable square with hard sync and a variable saw on OUT, two variable-shape oscillators in "monster sync" on AUX,
   polyBLEP and integrated polyBLEP on every edge. Its pitch offsets use Plaits' two pitch tables (semitones and
   1/256 semitones) in Q31: the 16-bit `exp2` the other engines use put the hard-sync patterns audibly off.
+- **MODAL** (`modal_engine.cc`, `modal_voice.cc`, `resonator.cc`): 24 band-pass modes excited by a filtered click. A
+  mode's Q reaches tens of thousands, where the damping term is a millionth of the filter's denominator: the
+  coefficients are computed with 31-bit mantissas and exponents (`struct uf`, one EMAC multiply each), cached while
+  pitch and knobs stay put, and the 24 filters run in a hand-written EMAC loop (23 instructions a mode and sample).
+- **STRING** (`string_engine.cc`, `string_voice.cc`, `string.cc`): three delay-line strings, 1024 + 256 samples
+  each, with a DC blocker, a damping low-pass, Hermite reads, and either a curved bridge or an allpass dispersion
+  driven by noise. It draws its random numbers in the same order as Plaits, so it can be compared sample by sample.
 - **Engine selection** (`MACRO_SEL`, `MACRO_MASK`): engines left out are not linked.
 
 Conventions follow MACRO: 32-bit phases, Q15 signals, knob values 0..127, no 64-bit arithmetic and no library calls
@@ -47,6 +54,8 @@ Each new engine was compared with Plaits' own source compiled for a PC, at the s
 | CHORDS | 8,464 | -56.7 dB | -65.5 dB / phase artifacts only (see below) |
 | WAVETABLE | 8,700 | -59.2 dB | -64.1 dB / -36.7 dB |
 | VA | 8,736 | -67.4 dB | -78.8 dB / -11.9 dB (see below) |
+| MODAL | 8,736 | -70.1 dB | -46.6 dB / -13.4 dB (see below) |
+| STRING | 8,736 | -64.2 dB | -66.0 dB / see below |
 | SWARM | 2,100 | (chaotic) | band levels: median 0.3 dB, worst 22.7 dB; float Plaits: 0.0 / 23.4 dB |
 
 The remaining CHORDS outliers are the OCT and 5 chords at the top inversion. Float Plaits rounds to inversion 20 there,
@@ -69,13 +78,23 @@ VA's worst cases are all AUX at full TIMBRE with HARMONICS in the middle: both o
 pitch with sync at exactly 16 times it, and their difference is nearly silent (around -45 dBFS) and very sensitive
 to rounding.
 
+MODAL's and STRING's worst cases sit where Plaits is itself unstable: modes with Q in the hundreds of thousands near
+the top of the band, and the lowest notes of STRING with full dispersion and endless decay. There, float Plaits
+and double Plaits differ by -20 to -40 dB, as much as the port does.
+
+Two things in the reference harness matter for anyone redoing this: Plaits sizes its engines' scratch buffers for
+24 samples (`kMaxBlockSize`), so a reference rendering 32-sample blocks must give STRING its own buffer, or the
+overflow lands in the first string's delay line; and the engines limited by the voice (MODAL, STRING) must go
+through the same `stmlib::Limiter` on both sides.
+
 ## In the firmware
 
 The PLAITS machine uses the added-machine mechanism of Modded-Cycles (as its Braids MACRO): relocated machine,
 name, descriptor and knob tables, a dispatch detour that sends machine 8 to PLAITS and the others to Model-TG, and a
-payload copied at boot to 0x46700000 (the top of Model-TG's sample region, given up for it). The engines take 102 KB
-of code and tables, 3 KB of variables for six voices. With Model-TG and 6-channel USB the decompressed OS ends at
-0x401da794, under the bootstrap's 0x40200000 limit.
+payload copied at boot to 0x46700000 (the top of Model-TG's sample region, given up for it). The engines take 115 KB
+of code and tables, and 92 KB of variables for six voices (mostly STRING's delay lines), which the boot hook zeroes
+and which take no room in the image. With Model-TG and 6-channel USB the decompressed OS ends at 0x401ddc50, under
+the bootstrap's 0x40200000 limit.
 
 CPU, in instructions per 32-sample block of the whole voice loop with one PLAITS track (166,667 cycles a block):
 
@@ -84,6 +103,8 @@ CPU, in instructions per 32-sample block of the whole voice loop with one PLAITS
 | WSHAPE | 4.1 % | 4.2 % |
 | FM | 4.1 % | 4.1 % |
 | VA | 5.8 % | 6.0 % |
+| MODAL | 14.3 % | 21.6 % while a knob moves |
+| STRING | 12.3 % | 12.6 % |
 | BDRUM | 5.2 % | 8.0 % |
 | GRAIN | 5.3 % | 5.4 % |
 | CHORDS | 11.5 % | 11.5 % |

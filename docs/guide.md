@@ -16,6 +16,8 @@
    | 5 | CHORDS |
    | 6 | SWARM |
    | 7 | WAVES |
+   | 8 | MODAL |
+   | 9 | STRING |
 
 4. COLOR, SWEEP and CONTOUR are Plaits' three macro controls: HARMONICS, TIMBRE and MORPH.
 
@@ -38,14 +40,19 @@ hold **Preset** and turn DECAY, SWEEP or CONTOUR for Attack, Filter and Resonanc
 | CHORDS | chord: OCT, 5, sus4, m, m7, m9, m11, 69, M9, M7, M | inversion, spread over five voices | organ registration, then the wavetable voices from the middle up |
 | SWARM | pitch spread of the eight voices | grain density | grain size: small sizes become glissandi |
 | WAVES | bank (four, mirrored; in the upper half the position snaps to whole waves) | X position on the 8x8 grid | Y position on the grid |
+| MODAL | material: bell-like partials at the left, a harmonic series in the middle, stretched partials to the right | brightness of the strike | decay |
+| STRING | left of the middle a curved bridge (a sitar-like buzz), a plain string in the middle, to the right more and more dispersion (stretched, piano-like, then rough) | brightness of the pluck | decay, endless at the top |
 
 Notes on some engines:
 
-- **BDRUM** makes its own envelope from each trig. Set DECAY long and let the engine shape the sound.
+- **BDRUM**, **MODAL** and **STRING** make their own envelope from each trig. Set DECAY long and let the engine shape
+  the sound.
+- **STRING** plucks three strings in turn, so a note keeps ringing while the next ones play, as on the module.
 - **FM** with feedback runs four times oversampled from the start of a note. Moving CONTOUR during a note keeps the
   rate the note started with, so there are no clicks.
 - **SWARM**: every trig starts a burst. The grains slow down after it, as with a patched trigger on the module.
-- **CHORDS** and **WAVES** are the heaviest engines. Two or three tracks of them at once are fine. More may crackle.
+- **MODAL**, **WAVES**, **STRING** and **CHORDS** are the heaviest engines (12 to 15 % of the CPU each, MODAL up to 22 %
+  while a knob moves). Two or three tracks of them at once are fine. More may crackle.
 
 ## Things that differ from the module
 

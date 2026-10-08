@@ -23,6 +23,8 @@ enum {
     MACRO_SWARM = 9,        /* Model-TG: eight grains or glissandi of saws (OUT) and sines (AUX)        */
     MACRO_WAVETABLE = 10,   /* Model-TG: 8 x 8 x 4 waves, trilinear (OUT), bit-crushed to 1/32 (AUX)    */
     MACRO_VA = 11,          /* Model-TG: virtual analog, sync square + detuned saw (OUT), monster sync (AUX) */
+    MACRO_MODAL = 12,       /* Model-TG: modal resonator, 24 modes (OUT), the click exciting it (AUX)              */
+    MACRO_STRING = 13,      /* Model-TG: inharmonic string, three Karplus-Strong strings (OUT), their bursts (AUX)  */
     MACRO_ENGINES
 };
 
@@ -213,12 +215,46 @@ struct macro_va {
     int32_t sq_gain, saw_gain;                      /* auxiliary_amount_, xmod_amount_: Q24            */
 };
 
+/* Model-TG: Plaits' string engine (string_engine.cc, string_voice.cc, string.cc) */
+#define MACRO_STRINGS 3
+struct macro_strv {
+    int32_t line[1024];                             /* string_, Q24                                    */
+    int32_t stretch[256];                           /* stretch_ (the dispersion allpass), Q24          */
+    int32_t wp, swp;                                /* their write positions                           */
+    struct macro_svf exc, damp;                     /* the burst's low-pass, the damping low-pass      */
+    int32_t exc_c[3];                               /* the burst filter's a1, a2, a3 (set on a trig)   */
+    int32_t remaining;                              /* noise samples left in the burst                 */
+    int32_t dc_x, dc_y;                             /* DCBlocker                                       */
+    int32_t disp, curve;                            /* dispersion_noise_ (Q30), curved_bridge_ (Q24)   */
+    int32_t out0, out1;                             /* out_sample_, Q24                                */
+    uint32_t src_phase;                             /* Q30                                             */
+    int32_t delay;                                  /* delay_, Q20                                     */
+    uint32_t f0;                                    /* f0_ of this string, a phase increment           */
+};
+struct macro_string {
+    struct macro_strv s[MACRO_STRINGS];
+    uint32_t f0_hist[16];                           /* f0_delay_                                       */
+    int32_t f0_wp, active, trig;
+};
+
+/* Model-TG: Plaits' modal engine (modal_engine.cc, modal_voice.cc, resonator.cc) */
+#define MACRO_MODAL_MODES 24
+struct macro_modal {
+    struct macro_svf exc;                           /* the click's low-pass, Q24                       */
+    struct macro_svf mode[MACRO_MODAL_MODES];       /* Q24                                             */
+    int32_t harm_lp;                                /* HARMONICS smoothed, Q24                         */
+    int32_t trig;
+    int32_t key[4];                                 /* inc, structure, brightness, damping of coef     */
+    int32_t key_cut, exc_c[3];                      /* the click filter's cutoff and a1, a2, a3        */
+    int32_t coef[MACRO_MODAL_MODES][4];             /* the modes' a1, a2, a3 (Q31) and gain (Q31)      */
+};
+
 struct macro_voice {
     uint8_t engine;                 /* the engine playing                                            */
     uint8_t latch;                  /* 1: take the engine from knob B at the next block              */
     uint8_t pad[2];                 /* (four bytes, then 32-bit words)                               */
     uint32_t rng;                   /* the voice's random numbers (stmlib's Random)                  */
-    int32_t lim_out, lim_aux;       /* the limiters' peaks (engines Plaits limits), Q17              */
+    int32_t lim_out, lim_aux;       /* the limiters' peaks (engines Plaits limits), Q24              */
     union {
         struct macro_wsh wsh;
         struct macro_fm fm;
@@ -232,6 +268,8 @@ struct macro_voice {
         struct macro_swarm swarm;
         struct macro_wavetable wt;
         struct macro_va va;
+        struct macro_modal modal;
+        struct macro_string string;
     } e;
 };
 
