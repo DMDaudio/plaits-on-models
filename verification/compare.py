@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The fixed-point CHORD (Model-TG src/macro/macro.c) against Plaits' float ChordEngine (chord_ref), same knobs
 (k/127), same f0, 32-sample blocks, after the knobs' one-pole has settled (0.5 s): the difference's level under
-the reference's RMS, OUT and AUX.  usage: compare.py [--quick] [--wav DIR]"""
+the reference's RMS, OUT and AUX.  usage: compare.py [--quick] [--wavetable | --va] [--float]"""
 import ctypes, itertools, pathlib, subprocess, sys, tempfile
 import numpy as np
 HERE = pathlib.Path(__file__).resolve().parent
@@ -9,8 +9,9 @@ SRC = HERE.parent / "engines"
 N = 48000
 FALLBACK, CRASH = [], []
 WT = "--wavetable" in sys.argv                                   # WAVETABLE instead of CHORD
-SEL, MASK = ("MACRO_WAVETABLE", "0x400") if WT else ("MACRO_CHORD", "0x100")
-REF = ("wt_ref" if WT else "chord_ref") + ("" if "--float" in sys.argv else "_d")   # default: Plaits in double
+VA = "--va" in sys.argv                                          # VA instead of CHORD
+SEL, MASK = ("MACRO_WAVETABLE", "0x400") if WT else ("MACRO_VA", "0x800") if VA else ("MACRO_CHORD", "0x100")
+REF = ("wt_ref" if WT else "va_ref" if VA else "chord_ref") + ("" if "--float" in sys.argv else "_d")   # default: Plaits in double
 lib = pathlib.Path(tempfile.mkdtemp()) / "m.so"
 subprocess.run(["cc", "-O2", "-w", "-shared", "-fPIC", "-DMACRO_SEL=" + SEL, "-DMACRO_MASK=" + MASK, "-DCHORD_BLOCK=32", "-DCHORD_FROM_ZERO", "-DWT_BLOCK=32", "-DWT_FROM_ZERO",
                 str(SRC / "macro.c"), "-o", str(lib)], check=True)

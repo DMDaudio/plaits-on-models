@@ -23,6 +23,10 @@ PARTICLE, BDRUM, SNARE, HIHAT and GRAIN in 32-bit integer C, checked against Pla
 - **SWARM** (`swarm_engine.cc`): eight grain envelopes driving polyBLEP saws (OUT) and quadrature sines (AUX).
 - **WAVETABLE** (`wavetable_engine.cc`): all 192 integrated waves, eight Hermite reads a sample, trilinear blend,
   differentiation normalised by 1/f once a block.
+- **VA** (`virtual_analog_engine.cc` variant 2, `variable_shape_oscillator.h`, `variable_saw_oscillator.h`): a
+  variable square with hard sync and a variable saw on OUT, two variable-shape oscillators in "monster sync" on AUX,
+  polyBLEP and integrated polyBLEP on every edge. Its pitch offsets use Plaits' two pitch tables (semitones and
+  1/256 semitones) in Q31: the 16-bit `exp2` the other engines use put the hard-sync patterns audibly off.
 - **Engine selection** (`MACRO_SEL`, `MACRO_MASK`): engines left out are not linked.
 
 Conventions follow MACRO: 32-bit phases, Q15 signals, knob values 0..127, no 64-bit arithmetic and no library calls
@@ -42,6 +46,7 @@ Each new engine was compared with Plaits' own source compiled for a PC, at the s
 |---|---|---|---|
 | CHORDS | 8,464 | -56.7 dB | -65.5 dB / phase artifacts only (see below) |
 | WAVETABLE | 8,700 | -59.2 dB | -64.1 dB / -36.7 dB |
+| VA | 8,736 | -67.4 dB | -78.8 dB / -11.9 dB (see below) |
 | SWARM | 2,100 | (chaotic) | band levels: median 0.3 dB, worst 22.7 dB; float Plaits: 0.0 / 23.4 dB |
 
 The remaining CHORDS outliers are the OCT and 5 chords at the top inversion. Float Plaits rounds to inversion 20 there,
@@ -60,13 +65,17 @@ These are in Plaits itself. The port keeps the first two and avoids the third:
   wave 8 of a row, past its 64-wave bank. On a PC both float and double Plaits crash at those settings (18 of the
   8,736 tested). The port clamps to the last wave.
 
+VA's worst cases are all AUX at full TIMBRE with HARMONICS in the middle: both oscillators then run at the same
+pitch with sync at exactly 16 times it, and their difference is nearly silent (around -45 dBFS) and very sensitive
+to rounding.
+
 ## In the firmware
 
 The PLAITS machine uses the added-machine mechanism of Modded-Cycles (as its Braids MACRO): relocated machine,
 name, descriptor and knob tables, a dispatch detour that sends machine 8 to PLAITS and the others to Model-TG, and a
-payload copied at boot to 0x46700000 (the top of Model-TG's sample region, given up for it). The engines take 99 KB
+payload copied at boot to 0x46700000 (the top of Model-TG's sample region, given up for it). The engines take 102 KB
 of code and tables, 3 KB of variables for six voices. With Model-TG and 6-channel USB the decompressed OS ends at
-0x401d91b8, under the bootstrap's 0x40200000 limit.
+0x401da794, under the bootstrap's 0x40200000 limit.
 
 CPU, in instructions per 32-sample block of the whole voice loop with one PLAITS track (166,667 cycles a block):
 
@@ -74,7 +83,7 @@ CPU, in instructions per 32-sample block of the whole voice loop with one PLAITS
 |---|---|---|
 | WSHAPE | 4.1 % | 4.2 % |
 | FM | 4.1 % | 4.1 % |
-| NOISE | 4.0 % | 4.0 % |
+| VA | 5.8 % | 6.0 % |
 | BDRUM | 5.2 % | 8.0 % |
 | GRAIN | 5.3 % | 5.4 % |
 | CHORDS | 11.5 % | 11.5 % |

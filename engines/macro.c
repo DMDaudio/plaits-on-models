@@ -2834,22 +2834,394 @@ uint32_t macro_inc_of_note(int32_t note_q16)
     return inc_of_log2(1653513 + (note_q16 - (69 << 16)) / 12);
 }
 
+/* ---- VA (Model-TG): plaits/dsp/engine/virtual_analog_engine.cc (VA_VARIANT 2),
+ * oscillator/variable_shape_oscillator.h, variable_saw_oscillator.h ------------------------------------- *
+ * OUT: a variable-width square (TIMBRE: width, then hard sync above the middle) plus a variable saw (MORPH: notch
+ * to triangle), detuned by HARMONICS (unison, fifth, octave, ... both ways); AUX: two variable-shape oscillators
+ * (MORPH: triangle, saw, square, width) in "monster sync" (TIMBRE). Signals Q28 inside, the edges corrected with
+ * polyBLEP and integrated polyBLEP as in Plaits; the slopes' reciprocals are the block's. */
+
+static inline int32_t q28mul(int32_t a, int32_t b) { return fmac1(a, b) << 3; }          /* Q28 x Q28 */
+static inline int32_t amt(int32_t x, int32_t a16) { return fmac1(x, a16 >= 65536 ? 0x7fffffff : a16 << 15); }   /* x a, a Q16 */
+static inline int32_t bthis(uint32_t t)                    /* ThisBlepSample: 0.5 t^2, t Q16, Q28 */
+{
+    t = t > 65535 ? 65535 : t;
+    return (int32_t)((t * t) >> 5);
+}
+static inline int32_t bnext(uint32_t t)                    /* NextBlepSample: -0.5 (1 - t)^2 */
+{
+    uint32_t u = t >= 65536 ? 0 : 65536 - t;
+    u = u > 65535 ? 65535 : u;
+    return -(int32_t)((u * u) >> 5);
+}
+static inline int32_t ithis(uint32_t t) { return iblep_next(65536 - (int32_t)(t > 65536 ? 65536 : t)) << 12; }
+static inline int32_t inext(uint32_t t) { return iblep_next((int32_t)(t > 65536 ? 65536 : t)) << 12; }
+static inline uint32_t mulq16(uint32_t a, uint32_t t16)    /* a x t, t Q16 (<= 1) */
+{
+    return (a >> 16) * t16 + (((a & 0xffff) * t16) >> 16);
+}
+
+/* 1 / pw and 1 / (1 - pw), Q15, for a pulse width pw (Q31) */
+static inline void slopes(int32_t pw31, uint32_t *up, uint32_t *down)
+{
+    uint32_t q = (uint32_t)pw31 >> 15;
+    q = q < 1 ? 1 : q > 65535 ? 65535 : q;
+    *up = 0x80000000u / q;
+    *down = 0x80000000u / (65536 - q);
+}
+
+/* the naive variable shape (saw, square, triangle) at phase ph, Q28; sq, tri: Q16 amounts */
+static inline int32_t vso_naive(uint32_t ph, uint32_t pw32, uint32_t up, uint32_t down, int32_t tri, int32_t sq)
+{
+    int32_t saw = (int32_t)(ph >> 4), square = ph < pw32 ? 0 : 1 << 28, triangle;
+    if (ph < pw32)
+        triangle = (int32_t)(((ph >> 16) * up) >> 3);
+    else
+        triangle = (1 << 28) - (int32_t)((((ph - pw32) >> 16) * down) >> 3);
+    saw += amt(square - saw, sq);
+    saw += amt(triangle - saw, tri);
+    return saw;
+}
+
+static void vso_init(struct macro_vso *o, uint32_t master_phase)
+{
+    o->mph = master_phase;
+    o->sph = 0;
+    o->mf = 0;
+    o->sf = 42949673u;                                       /* 0.01 */
+    o->pw31 = o->ppw31 = 1 << 30;                            /* 0.5 */
+    o->ws = 0;
+    o->next = 0;
+    o->high = 0;
+}
+
+/* VariableShapeOscillator::Render (sync: master mf, slave sf); writes Q28 into out */
+static void vso_render(struct macro_vso *__restrict o, int sync, uint32_t mf, uint32_t sf, int32_t pw31, int32_t ws,
+                       int32_t *__restrict out, int n)
+{
+    uint32_t up, down, mph = o->mph, sph = o->sph, m_f = o->mf, s_f = o->sf;
+    int32_t mfd, sfd, pwd, wsd, pw = o->pw31, ppw = o->ppw31, w = o->ws, next = o->next, high = o->high, i;
+    if (mf > 0x40000000u)
+        mf = 0x40000000u;
+    if (sf > 0x40000000u)
+        sf = 0x40000000u;
+    if (sf >= 0x40000000u)
+        pw31 = 1 << 30;
+    else if (pw31 < (int32_t)sf)                              /* within 2f .. 1 - 2f */
+        pw31 = (int32_t)sf;
+    else if (pw31 > 0x7fffffff - (int32_t)sf)
+        pw31 = 0x7fffffff - (int32_t)sf;
+    mfd = ((int32_t)mf - (int32_t)m_f) / n;
+    sfd = ((int32_t)sf - (int32_t)s_f) / n;
+    pwd = (pw31 - pw) / n;
+    wsd = (ws - w) / n;
+    slopes(pw31, &up, &down);
+    for (i = 0; i < n; i++) {
+        int32_t this_s = next, sq, tri, reset = 0, trans = 0, step;
+        uint32_t rt = 0, pw32, old;
+        int wrapped;
+        next = 0;
+        m_f += (uint32_t)mfd;
+        s_f += (uint32_t)sfd;
+        pw += pwd;
+        w += wsd;
+        sq = w > 32768 ? (w - 32768) * 2 : 0;
+        tri = w < 32768 ? 65536 - 2 * w : 0;
+        pw32 = (uint32_t)pw << 1;
+        step = amt((int32_t)((((up + down) >> 1) * (s_f >> 16)) >> 2), tri);   /* (up + down) f tri, Q28 */
+        if (sync) {
+            old = mph;
+            mph += m_f;
+            if (mph < old) {                                     /* the master restarts: reset */
+                uint32_t at, a0 = sph;
+                int32_t value;
+                rt = (uint32_t)sub_sample(mph, m_f);
+                at = sph + mulq16(s_f, 65536 - rt);
+                reset = 1;
+                if (at < a0)
+                    trans = 1;
+                if (!high && at >= pw32)
+                    trans = 1;
+                value = vso_naive(at, pw32, up, down, tri, sq);
+                this_s -= q28mul(value, bthis(rt));
+                next -= q28mul(value, bnext(rt));
+            }
+        }
+        old = sph;
+        sph += s_f;
+        wrapped = sph < old;
+        if (trans || !reset) {
+            for (;;) {
+                if (!high) {
+                    uint32_t t;
+                    if (!wrapped && sph < pw32)
+                        break;
+                    t = (uint32_t)sub_sample(sph - pw32, (uint32_t)((int32_t)(((uint32_t)ppw << 1) - pw32) + (int32_t)s_f));
+                    this_s += amt(bthis(t), sq);
+                    next += amt(bnext(t), sq);
+                    this_s -= q28mul(step, ithis(t));
+                    next -= q28mul(step, inext(t));
+                    high = 1;
+                }
+                if (high) {
+                    uint32_t t;
+                    if (!wrapped)
+                        break;
+                    wrapped = 0;
+                    t = (uint32_t)sub_sample(sph, s_f);
+                    this_s -= amt(bthis(t), 65536 - tri);
+                    next -= amt(bnext(t), 65536 - tri);
+                    this_s += q28mul(step, ithis(t));
+                    next += q28mul(step, inext(t));
+                    high = 0;
+                }
+            }
+        }
+        if (sync && reset) {
+            sph = mulq16(s_f, rt);
+            high = 0;
+        }
+        next += vso_naive(sph, pw32, up, down, tri, sq);
+        ppw = pw;
+        out[i] = (this_s << 1) - (1 << 28);
+    }
+    o->mph = mph;
+    o->sph = sph;
+    o->mf = mf;
+    o->sf = sf;
+    o->pw31 = pw31;
+    o->ppw31 = ppw;
+    o->ws = ws;
+    o->next = next;
+    o->high = high;
+}
+
+#define NOTCH (53687091)                                     /* kVariableSawNotchDepth 0.2, Q28 */
+
+static void vsaw_init(struct macro_vsaw *o)
+{
+    o->ph = 0;
+    o->f = 42949673u;
+    o->pw31 = o->ppw31 = 1 << 30;
+    o->ws = 0;
+    o->next = 0;
+    o->high = 0;
+}
+
+/* VariableSawOscillator::Render: writes Q28 into out */
+static void vsaw_render(struct macro_vsaw *__restrict o, uint32_t f, int32_t pw31, int32_t ws, int32_t *__restrict out, int n)
+{
+    uint32_t up, down, ph = o->ph, fr = o->f;
+    int32_t fd, pwd, wsd, pw = o->pw31, ppw = o->ppw31, w = o->ws, next = o->next, high = o->high, i;
+    if (f > 0x40000000u)
+        f = 0x40000000u;
+    if (f >= 0x40000000u)
+        pw31 = 1 << 30;
+    else if (pw31 < (int32_t)f)
+        pw31 = (int32_t)f;
+    else if (pw31 > 0x7fffffff - (int32_t)f)
+        pw31 = 0x7fffffff - (int32_t)f;
+    fd = ((int32_t)f - (int32_t)fr) / n;
+    pwd = (pw31 - pw) / n;
+    wsd = (ws - w) / n;
+    slopes(pw31, &up, &down);
+    for (i = 0; i < n; i++) {
+        int32_t this_s = next, tri_a, notch_a, step, v;
+        uint32_t pw32, old;
+        int wrapped;
+        next = 0;
+        fr += (uint32_t)fd;
+        pw += pwd;
+        w += wsd;
+        tri_a = w;
+        notch_a = 65536 - w;
+        pw32 = (uint32_t)pw << 1;
+        step = amt((int32_t)((((up + down) >> 1) * (fr >> 16)) >> 2), tri_a);
+        old = ph;
+        ph += fr;
+        wrapped = ph < old;
+        if (!high && (wrapped || ph >= pw32)) {
+            int32_t notch = amt((1 << 28) + NOTCH - (int32_t)(pw32 >> 4), notch_a);
+            uint32_t t = (uint32_t)sub_sample(ph - pw32, (uint32_t)((int32_t)(((uint32_t)ppw << 1) - pw32) + (int32_t)fr));
+            this_s += q28mul(notch, bthis(t));
+            next += q28mul(notch, bnext(t));
+            this_s -= q28mul(step, ithis(t));
+            next -= q28mul(step, inext(t));
+            high = 1;
+        }
+        if (high && wrapped) {
+            int32_t notch = amt((1 << 28) + NOTCH, notch_a);
+            uint32_t t = (uint32_t)sub_sample(ph, fr);
+            this_s -= q28mul(notch, bthis(t));
+            next -= q28mul(notch, bnext(t));
+            this_s += q28mul(step, ithis(t));
+            next += q28mul(step, inext(t));
+            high = 0;
+        }
+        if (ph < pw32)
+            v = amt((int32_t)(ph >> 4), notch_a) + amt((int32_t)(((ph >> 16) * up) >> 3), tri_a);
+        else
+            v = amt((1 << 28) + NOTCH, notch_a) + amt((1 << 28) - (int32_t)((((ph - pw32) >> 16) * down) >> 3), tri_a);
+        next += v;
+        ppw = pw;
+        out[i] = fmac1((this_s << 1) - (1 << 28), 1789569707);   /* / (1 + 0.2) */
+    }
+    o->ph = ph;
+    o->f = f;
+    o->pw31 = pw31;
+    o->ppw31 = ppw;
+    o->ws = ws;
+    o->next = next;
+    o->high = high;
+}
+
+static COLD void va_init(struct macro_va *v)
+{
+    vso_init(&v->primary, 0);
+    vso_init(&v->auxiliary, 0x40000000u);                  /* set_master_phase(0.25) */
+    vso_init(&v->sync, 0);
+    vsaw_init(&v->saw);
+    v->sq_gain = v->saw_gain = 0;
+}
+
+/* SemitonesToRatio's tables, Q31: 2^(k / 12) and 2^(k / 256 / 12) */
+static const uint32_t pitch_semi[12] = {
+    2147483648u, 2275179671u, 2410468894u, 2553802834u, 2705659852u, 2866546760u,
+    3037000500u, 3217589947u, 3408917802u, 3611622603u, 3826380858u, 4053909305u,
+};
+static const uint32_t pitch_fine[256] = {
+    2147483648u, 2147968248u, 2148452957u, 2148937775u, 2149422703u, 2149907740u,
+    2150392887u, 2150878143u, 2151363509u, 2151848984u, 2152334569u, 2152820263u,
+    2153306067u, 2153791980u, 2154278004u, 2154764136u, 2155250379u, 2155736731u,
+    2156223193u, 2156709765u, 2157196447u, 2157683238u, 2158170140u, 2158657151u,
+    2159144272u, 2159631503u, 2160118844u, 2160606295u, 2161093856u, 2161581527u,
+    2162069308u, 2162557199u, 2163045200u, 2163533311u, 2164021532u, 2164509864u,
+    2164998306u, 2165486858u, 2165975520u, 2166464293u, 2166953175u, 2167442169u,
+    2167931272u, 2168420486u, 2168909810u, 2169399245u, 2169888790u, 2170378446u,
+    2170868212u, 2171358088u, 2171848076u, 2172338173u, 2172828382u, 2173318700u,
+    2173809130u, 2174299670u, 2174790321u, 2175281083u, 2175771955u, 2176262939u,
+    2176754033u, 2177245237u, 2177736553u, 2178227980u, 2178719517u, 2179211165u,
+    2179702925u, 2180194795u, 2180686776u, 2181178868u, 2181671072u, 2182163386u,
+    2182655811u, 2183148348u, 2183640996u, 2184133755u, 2184626625u, 2185119606u,
+    2185612699u, 2186105903u, 2186599218u, 2187092644u, 2187586182u, 2188079831u,
+    2188573592u, 2189067464u, 2189561447u, 2190055542u, 2190549748u, 2191044066u,
+    2191538496u, 2192033037u, 2192527690u, 2193022454u, 2193517330u, 2194012317u,
+    2194507417u, 2195002628u, 2195497950u, 2195993385u, 2196488931u, 2196984590u,
+    2197480360u, 2197976241u, 2198472235u, 2198968341u, 2199464559u, 2199960888u,
+    2200457330u, 2200953884u, 2201450549u, 2201947327u, 2202444217u, 2202941219u,
+    2203438333u, 2203935560u, 2204432898u, 2204930349u, 2205427912u, 2205925587u,
+    2206423375u, 2206921275u, 2207419287u, 2207917412u, 2208415649u, 2208913999u,
+    2209412461u, 2209911035u, 2210409722u, 2210908522u, 2211407434u, 2211906458u,
+    2212405596u, 2212904845u, 2213404208u, 2213903683u, 2214403271u, 2214902972u,
+    2215402785u, 2215902712u, 2216402751u, 2216902903u, 2217403167u, 2217903545u,
+    2218404036u, 2218904639u, 2219405356u, 2219906185u, 2220407128u, 2220908183u,
+    2221409352u, 2221910633u, 2222412028u, 2222913536u, 2223415157u, 2223916892u,
+    2224418739u, 2224920700u, 2225422774u, 2225924961u, 2226427262u, 2226929676u,
+    2227432204u, 2227934844u, 2228437599u, 2228940466u, 2229443447u, 2229946542u,
+    2230449750u, 2230953072u, 2231456507u, 2231960056u, 2232463719u, 2232967495u,
+    2233471385u, 2233975388u, 2234479506u, 2234983737u, 2235488082u, 2235992540u,
+    2236497113u, 2237001799u, 2237506600u, 2238011514u, 2238516542u, 2239021684u,
+    2239526940u, 2240032310u, 2240537794u, 2241043393u, 2241549105u, 2242054931u,
+    2242560872u, 2243066927u, 2243573095u, 2244079379u, 2244585776u, 2245092288u,
+    2245598914u, 2246105654u, 2246612509u, 2247119478u, 2247626561u, 2248133759u,
+    2248641071u, 2249148498u, 2249656039u, 2250163695u, 2250671465u, 2251179350u,
+    2251687350u, 2252195464u, 2252703693u, 2253212037u, 2253720495u, 2254229068u,
+    2254737756u, 2255246558u, 2255755475u, 2256264508u, 2256773655u, 2257282917u,
+    2257792294u, 2258301786u, 2258811392u, 2259321114u, 2259830951u, 2260340903u,
+    2260850970u, 2261361152u, 2261871449u, 2262381861u, 2262892389u, 2263403032u,
+    2263913790u, 2264424663u, 2264935651u, 2265446755u, 2265957974u, 2266469309u,
+    2266980759u, 2267492324u, 2268004005u, 2268515801u, 2269027713u, 2269539740u,
+    2270051883u, 2270564141u, 2271076515u, 2271589004u, 2272101610u, 2272614330u,
+    2273127167u, 2273640119u, 2274153187u, 2274666371u,
+};
+
+/* inc x 2^(semitones / 12), semitones Q16, read in steps of 1/256 semitone as Plaits' NoteToFrequency does */
+static uint32_t va_freq(uint32_t inc, int32_t semis)
+{
+    int32_t q = semis >> 8, oct = (q + 3072 * 16) / 3072 - 16, r = q - oct * 3072;
+    return sat_shl(mulhi(inc, mulhi(pitch_semi[r >> 8], pitch_fine[r & 255])), oct + 2);
+}
+
+static void va_render(struct macro_va *__restrict v, const uint8_t *p, uint32_t inc, int32_t *__restrict out,
+                      int32_t *__restrict aux, int n, int want_out, int want_aux)
+{
+    static const int32_t iv[5] = { 0, 459407, 787087, 1245839, 1573519 };   /* 0, 7.01, 12.01, 19.01, 24.01 */
+    int32_t harm = k16(p[MACRO_P_HARM]), timb = k16(p[MACRO_P_TIMB]), morph = k16(p[MACRO_P_MORPH]);
+    int32_t d, sign, di, df, sq, det, sync_amount, shape, pw, i;
+    int32_t a[32], b[32];
+    uint32_t aux_f;
+    /* ComputeDetuning(HARMONICS): -24 .. 24 semitones, flat on the intervals */
+    d = harm * 2 + ((harm * 3277) >> 16) - 67174;                 /* 2.05 HARMONICS - 1.025 */
+    d = d < -65536 ? -65536 : d > 65536 ? 65536 : d;
+    sign = d < 0 ? -1 : 1;
+    d *= sign;
+    d = d * 4 - d / 10000;                                       /* x 3.9999 */
+    di = d >> 16;
+    df = d & 0xffff;
+    sq = (int32_t)((((uint32_t)df * (uint32_t)df) >> 16) * (uint32_t)(196608 - 2 * df) >> 16);   /* Squash */
+    sq = (int32_t)((((uint32_t)sq * (uint32_t)sq) >> 16) * (uint32_t)(196608 - 2 * sq) >> 16);
+    det = (iv[di] + fmac1(iv[di + 1] - iv[di], sq >= 65536 ? 0x7fffffff : sq << 15)) * sign;
+    aux_f = va_freq(inc, det);
+    sync_amount = (timb * timb) >> 16;
+    shape = (morph * 3) >> 1;
+    shape = shape > 65535 ? 65535 : shape;
+    pw = (1 << 30) + ((((morph - 43254) * 47841) >> 16) << 16);   /* 0.5 + (MORPH - 0.66) 1.46, Q31 */
+    pw = pw < (1 << 30) ? 1 << 30 : pw > 2136746229 ? 2136746229 : pw;   /* 0.5 .. 0.995 */
+    for (i = 0; i < n; i++)
+        out[i] = aux[i] = 0;
+    if (want_aux) {                                              /* monster sync */
+        uint32_t ps = va_freq(inc, sync_amount * 48), as = va_freq(inc, det + sync_amount * 48);
+        vso_render(&v->primary, 1, inc, ps, pw, shape, a, n);
+        vso_render(&v->auxiliary, 1, aux_f, as, pw, shape, b, n);
+        for (i = 0; i < n; i++)
+            aux[i] = (((b[i] - a[i]) >> 1) + 4096) >> 13;       /* Q15 */
+    }
+    if (want_out) {
+        int32_t spw, ratio, sg, swpw, swsh, swg, m, st, wt, sgd, wgd;
+        spw = timb + ((timb * 19661) >> 16) - 9830;            /* 1.3 TIMBRE - 0.15, Q16 */
+        spw = spw < 328 ? 328 : spw > 32768 ? 32768 : spw;    /* 0.005 .. 0.5 */
+        ratio = timb < 32768 ? 0 : (int32_t)((((uint32_t)(timb - 32768) * (uint32_t)(timb - 32768)) >> 16) * 192);   /* (T - .5)^2 4 48 */
+        sg = timb * 8 > 65536 ? 65536 : timb * 8;
+        swpw = morph < 32768 ? morph + 32768 : 65536 - (morph - 32768) * 2;
+        swpw += (swpw * 6554) >> 16;                           /* x 1.1 */
+        swpw = swpw < 328 ? 328 : swpw > 65535 ? 65535 : swpw;
+        swsh = 655360 - 21 * morph;                            /* 10 - 21 MORPH */
+        swsh = swsh < 0 ? 0 : swsh > 65536 ? 65536 : swsh;
+        swg = 8 * (65536 - morph);
+        swg = swg < 1311 ? 1311 : swg > 65536 ? 65536 : swg;  /* 0.02 .. 1 */
+        vso_render(&v->sync, 1, inc, va_freq(inc, ratio), spw << 15, 65536, a, n);
+        vsaw_render(&v->saw, aux_f, swpw >= 65535 ? 0x7fffffff : swpw << 15, swsh, b, n);
+        m = sg > swg ? sg : swg;
+        st = (int32_t)(((uint32_t)sg * 19661u / (uint32_t)m) << 8);   /* square gain 0.3 / max, Q24 */
+        wt = (int32_t)(((uint32_t)swg * 32768u / (uint32_t)m) << 8);  /* saw gain 0.5 / max */
+        sgd = (st - v->sq_gain) / n;
+        wgd = (wt - v->saw_gain) / n;
+        for (i = 0; i < n; i++) {
+            v->sq_gain += sgd;
+            v->saw_gain += wgd;
+            out[i] = ((fmac1(b[i], v->saw_gain << 7) + fmac1(a[i], v->sq_gain << 7)) + 4096) >> 13;
+        }
+        v->sq_gain = st;
+        v->saw_gain = wt;
+    }
+}
+
 /* the gains Plaits' voice gives each engine's OUT and AUX (voice.cc, RegisterInstance), Q15. An engine
  * Plaits registers with a negative gain goes through its limiter (limit()) and then 0.8. */
-static const int16_t gain_out[MACRO_ENGINES] = {22938, 19661, 26214, 26214, 26214, 26214, 26214, 22938, 26214, 26214, 19661};  /* WSH .7, FM .6, NOISE, PART lim; drums .8; GRAIN .7 */
-static const int16_t gain_aux[MACRO_ENGINES] = {19661, 19661, 26214, 32767, 26214, 26214, 26214, 19661, 26214, 32767, 19661};  /* WSH .6, FM .6, NOISE lim, PART 1; drums .8; GRAIN .6 */
+static const int16_t gain_out[MACRO_ENGINES] = {22938, 19661, 26214, 26214, 26214, 26214, 26214, 22938, 26214, 26214, 19661, 26214};  /* WSH .7, FM .6, NOISE, PART lim; drums .8; GRAIN .7 */
+static const int16_t gain_aux[MACRO_ENGINES] = {19661, 19661, 26214, 32767, 26214, 26214, 26214, 19661, 26214, 32767, 19661, 26214};  /* WSH .6, FM .6, NOISE lim, PART 1; drums .8; GRAIN .6 */
 
-const char *const macro_engine_name[MACRO_ENGINES] = {"WSHAPE", "2OP FM", "NOISE", "PARTCL", "BDRUM", "SNARE", "HIHAT", "GRAIN", "CHORDS", "SWARM", "WAVES"};
+const char *const macro_engine_name[MACRO_ENGINES] = {"WSHAPE", "2OP FM", "NOISE", "PARTCL", "BDRUM", "SNARE", "HIHAT", "GRAIN", "CHORDS", "SWARM", "WAVES", "VA"};
 
 /* Model-TG: which engines are built in, and their order on the ENGN knob. MACRO_SEL is a list of MACRO_*
  * ids (build.py --plaits-engines); an engine not in it is never called, so its code and tables are not
  * linked. Knob zone k (8 values each) plays the k-th engine of the list; past the last, the last. */
 #ifndef MACRO_SEL
 #define MACRO_SEL MACRO_WSH, MACRO_FM, MACRO_NOISE, MACRO_PARTICLE, MACRO_BD, MACRO_SD, MACRO_HH, MACRO_GRAIN, \
-                  MACRO_CHORD, MACRO_SWARM, MACRO_WAVETABLE
+                  MACRO_CHORD, MACRO_SWARM, MACRO_WAVETABLE, MACRO_VA
 #endif
 #ifndef MACRO_MASK                     /* bit e set: engine e is in MACRO_SEL (build.py passes both) */
-#define MACRO_MASK 0x7ff
+#define MACRO_MASK 0xfff
 #endif
 static const uint8_t macro_sel[] = { MACRO_SEL };
 #define MACRO_NSEL ((int)sizeof macro_sel)
@@ -2876,6 +3248,7 @@ static void engine_init(struct macro_voice *m)
     case MACRO_CHORD: if (HAS(MACRO_CHORD)) chord_init(&m->e.chord); break;
     case MACRO_SWARM: if (HAS(MACRO_SWARM)) swarm_init(&m->e.swarm); break;
     case MACRO_WAVETABLE: if (HAS(MACRO_WAVETABLE)) wt_init(&m->e.wt); break;
+    case MACRO_VA: if (HAS(MACRO_VA)) va_init(&m->e.va); break;
     default: break;
     }
 }
@@ -2964,6 +3337,10 @@ static void macro_render_e(struct macro_voice *m, const uint8_t *p, uint32_t inc
     case MACRO_GRAIN:
         if (!HAS(MACRO_GRAIN)) goto none;
         grain_render(&m->e.grain, p, inc, o, a, n, mix < 32767, mix > 0);
+        break;
+    case MACRO_VA:
+        if (!HAS(MACRO_VA)) goto none;
+        va_render(&m->e.va, p, inc, o, a, n, mix < 32767, mix > 0);
         break;
     case MACRO_WAVETABLE:
         if (!HAS(MACRO_WAVETABLE)) goto none;

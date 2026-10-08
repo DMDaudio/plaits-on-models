@@ -13,7 +13,8 @@ ER=path/to/eurorack
 SRCS="$ER/plaits/resources.cc $ER/stmlib/dsp/units.cc $ER/stmlib/utils/random.cc"
 c++ -O2 -DTEST -w -I$ER chord_ref.cc $ER/plaits/dsp/engine/chord_engine.cc $ER/plaits/dsp/chords/chord_bank.cc $SRCS -o chord_ref
 c++ -O2 -DTEST -w -include dbl.h -I$ER chord_ref.cc $ER/plaits/dsp/engine/chord_engine.cc $ER/plaits/dsp/chords/chord_bank.cc $SRCS -o chord_ref_d
-# same for swarm_ref.cc (engine/swarm_engine.cc) and wt_ref.cc (engine/wavetable_engine.cc)
+# same for swarm_ref.cc (engine/swarm_engine.cc), wt_ref.cc (engine/wavetable_engine.cc)
+# and va_ref.cc (engine/virtual_analog_engine.cc)
 ```
 
 ## Comparisons
@@ -21,6 +22,7 @@ c++ -O2 -DTEST -w -include dbl.h -I$ER chord_ref.cc $ER/plaits/dsp/engine/chord_
 ```sh
 python3 compare.py                 # CHORDS, 8,464 cases
 python3 compare.py --wavetable     # WAVETABLE, 8,736 cases
+python3 compare.py --va            # VA, 8,736 cases
 python3 swarm_compare.py           # SWARM, 2,100 cases, by band levels
 ```
 
@@ -28,8 +30,8 @@ Add `--quick` for a smaller sweep. They need numpy.
 
 ## Unit tests
 
-`ss_test.cc` (organ voice), `wt_test.cc` (wavetable voice) and `genv_test.cc` (SWARM grain envelope) compare one
-building block at a time. `ss_ours.c` exposes the static functions of `macro.c` to them. Build with the C file
+`ss_test.cc` (organ voice), `wt_test.cc` (wavetable voice), `genv_test.cc` (SWARM grain envelope) and `va_test.cc`
+(VA's two oscillators, with `va_ours.c`) compare one building block at a time. `ss_ours.c` exposes the static functions of `macro.c` to them. Build with the C file
 compiled as C and the test as C++, for example:
 
 ```sh

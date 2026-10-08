@@ -22,6 +22,7 @@ enum {
     MACRO_CHORD = 8,        /* Model-TG: chords, five divide-down/wavetable voices (OUT), the root (AUX) */
     MACRO_SWARM = 9,        /* Model-TG: eight grains or glissandi of saws (OUT) and sines (AUX)        */
     MACRO_WAVETABLE = 10,   /* Model-TG: 8 x 8 x 4 waves, trilinear (OUT), bit-crushed to 1/32 (AUX)    */
+    MACRO_VA = 11,          /* Model-TG: virtual analog, sync square + detuned saw (OUT), monster sync (AUX) */
     MACRO_ENGINES
 };
 
@@ -194,6 +195,24 @@ struct macro_wavetable {
     int32_t  prev, dlp;                             /* the differentiator, Q8 table units              */
 };
 
+/* Model-TG: Plaits' virtual analog engine (virtual_analog_engine.cc, VA_VARIANT 2) */
+struct macro_vso {                                  /* VariableShapeOscillator                         */
+    uint32_t mph, sph;                              /* master, slave phase                             */
+    uint32_t mf, sf;                                /* what the frequencies glide from                 */
+    int32_t  pw31, ppw31;                           /* pulse width, previous one (Q31)                 */
+    int32_t  ws;                                    /* waveshape, Q16                                  */
+    int32_t  next, high;                            /* Q28                                             */
+};
+struct macro_vsaw {                                 /* VariableSawOscillator                           */
+    uint32_t ph, f;
+    int32_t  pw31, ppw31, ws, next, high;
+};
+struct macro_va {
+    struct macro_vso primary, auxiliary, sync;
+    struct macro_vsaw saw;
+    int32_t sq_gain, saw_gain;                      /* auxiliary_amount_, xmod_amount_: Q24            */
+};
+
 struct macro_voice {
     uint8_t engine;                 /* the engine playing                                            */
     uint8_t latch;                  /* 1: take the engine from knob B at the next block              */
@@ -212,6 +231,7 @@ struct macro_voice {
         struct macro_chord chord;
         struct macro_swarm swarm;
         struct macro_wavetable wt;
+        struct macro_va va;
     } e;
 };
 

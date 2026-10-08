@@ -10,7 +10,7 @@
    |---|---|
    | 0 | WSHAPE |
    | 1 | FM |
-   | 2 | NOISE |
+   | 2 | VA |
    | 3 | BDRUM |
    | 4 | GRAIN |
    | 5 | CHORDS |
@@ -32,7 +32,7 @@ hold **Preset** and turn DECAY, SWEEP or CONTOUR for Attack, Filter and Resonanc
 |---|---|---|---|
 | WSHAPE | waveshaper curve | wavefolder amount | waveform asymmetry |
 | FM | frequency ratio, in steps | modulation index | feedback: phase feedback below the middle, self-modulation above |
-| NOISE | filter response, low-pass through band-pass to high-pass | clock rate of the noise | resonance |
+| VA | detune of the second oscillator: unison in the middle, then fifth, octave, ... up to two octaves either way | square: pulse width, then hard sync above the middle | saw: notch, then triangle, then narrower |
 | BDRUM | attack FM, self-FM and drive | tone | decay |
 | GRAIN | formant ratio and carrier bleed | formant frequency | carrier shape |
 | CHORDS | chord: OCT, 5, sus4, m, m7, m9, m11, 69, M9, M7, M | inversion, spread over five voices | organ registration, then the wavetable voices from the middle up |

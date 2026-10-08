@@ -15,7 +15,7 @@ risk. No firmware is distributed here: you build it from your own copy of the of
 |---|---|---|
 | 0 | WSHAPE | waveshaping oscillator |
 | 1 | FM | two-operator FM |
-| 2 | NOISE | filtered noise |
+| 2 | VA | two oscillators: variable square and saw, detune, hard sync |
 | 3 | BDRUM | analog and synthetic bass drum |
 | 4 | GRAIN | granular formant oscillator |
 | 5 | CHORDS | chords (string machine, then wavetable) |

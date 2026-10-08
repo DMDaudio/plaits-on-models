@@ -31,7 +31,7 @@ python3 tools/build.py -i path/to/model-cycles_OS1.13.syx -t model-tg-st,plaits-
 - PLAITS cannot be combined with Modded-Cycles' Braids MACRO or Syntakt engines: they use the same memory.
 - To change the engines or their order, pass `--engines` to `gen_plaits.py`, for example
   `--engines CHORDS,WAVETABLE,SWARM,FM`. The choices are WSHAPE, FM, NOISE, PARTICLE, BDRUM, SNARE, HIHAT, GRAIN,
-  CHORDS, SWARM and WAVETABLE, up to 16. Changing the list changes what a saved SHAPE value plays.
+  CHORDS, SWARM, WAVETABLE and VA, up to 16. The default is WSHAPE, FM, VA, BDRUM, GRAIN, CHORDS, SWARM, WAVETABLE. Changing the list changes what a saved SHAPE value plays.
 
 Check the build in emulation (a few minutes):
 
