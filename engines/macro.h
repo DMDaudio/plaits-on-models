@@ -25,6 +25,7 @@ enum {
     MACRO_VA = 11,          /* Model-TG: virtual analog, sync square + detuned saw (OUT), monster sync (AUX) */
     MACRO_MODAL = 12,       /* Model-TG: modal resonator, 24 modes (OUT), the click exciting it (AUX)              */
     MACRO_STRING = 13,      /* Model-TG: inharmonic string, three Karplus-Strong strings (OUT), their bursts (AUX)  */
+    MACRO_SIXOP = 14,       /* Model-TG: 6-operator FM, the 96 DX7 patches of Plaits' three banks (OUT = AUX)        */
     MACRO_ENGINES
 };
 
@@ -215,6 +216,41 @@ struct macro_va {
     int32_t sq_gain, saw_gain;                      /* auxiliary_amount_, xmod_amount_: Q24            */
 };
 
+/* a value as a 31-bit mantissa and an exponent: m 2^(e - 30), m in [2^30, 2^31) (macro.c's MODAL and 6-OP) */
+struct uf { int32_t m, e; };
+
+/* Model-TG: Plaits' 6-op FM engine (engine2/six_op_engine.cc, fm/) */
+struct macro_dxop_p {                               /* a patch's operator, unpacked (fm::Patch)        */
+    uint8_t rate[4], level[4], bp, ld, rd, lc, rc, rs, ams, vs, out, mode, coarse, fine, detune;
+};
+struct macro_dxpatch {
+    struct macro_dxop_p op[6];
+    uint8_t prate[4], plevel[4], algorithm, feedback, reset_phase;
+    uint8_t lrate, ldelay, lpmd, lamd, lreset, lwave, lpms;
+};
+struct macro_dxop { uint32_t phase; int32_t amp; };          /* amplitude Q27                         */
+struct macro_dxenv {                                /* fm::Envelope: levels Q24, phase Q30             */
+    int32_t stage, phase, start;
+    struct uf inc[4];
+    int32_t level[4];
+};
+struct macro_dxvoice {                              /* FMVoice: the patch, fm::Voice, its Lfo          */
+    struct macro_dxpatch p;
+    struct macro_dxop op[6];
+    struct macro_dxenv env[6], penv;
+    struct uf ratio[6];
+    int32_t headroom[6], fb[2];
+    int32_t patch, dirty, gate, gate_;
+    int32_t note, nvel, inc, bright, ectl, pitch_mod, amp_mod;
+    uint32_t lph, lfreq, ldp, ldinc[2];
+    int32_t lval, lrand, amd, pmd;
+};
+struct macro_sixop {
+    struct macro_dxvoice v[2];
+    int32_t tmp[3 * 64], acc[32];                   /* temp_buffer_, acc_buffer_ (Q26)                 */
+    int32_t active, rendered, gate, trig, quant;
+};
+
 /* Model-TG: Plaits' string engine (string_engine.cc, string_voice.cc, string.cc) */
 #define MACRO_STRINGS 3
 struct macro_strv {
@@ -270,6 +306,7 @@ struct macro_voice {
         struct macro_va va;
         struct macro_modal modal;
         struct macro_string string;
+        struct macro_sixop sixop;
     } e;
 };
 

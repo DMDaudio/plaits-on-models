@@ -24,6 +24,9 @@
 - **2026-10-08** MACRO's limiter (shared by NOISE, PARTICLE, SWARM, MODAL, STRING) rewritten: its peak was too coarse,
   so it released 15 % too fast.
 
+- **2026-10-08** 6-OP (Plaits' six-operator FM) ported with all 96 patches of its three banks in one engine, checked
+  against Plaits. Eleven engines in the default set.
+
 ## Tested on hardware
 
 | Build | Device | Result |
@@ -32,12 +35,12 @@
 | Model-TG + PLAITS machine + 6ch USB | | not yet installed |
 | Model-TG + PLAITS machine (VA instead of NOISE) + 6ch USB | | not yet installed |
 | Model-TG + PLAITS machine (10 engines, with MODAL and STRING) + 6ch USB | | not yet installed |
+| Model-TG + PLAITS machine (11 engines, with 6-OP) + 6ch USB | | not yet installed |
 
 ## Next
 
 - Install the PLAITS machine build on the Model:Samples and report what works.
 - Engine names on the SHAPE value instead of numbers.
 - AUX output on a knob (or a setting).
-- 6-op FM (DX7 patches): in progress.
 - SPEECH: three speech synthesisers and the LPC word banks, the largest engine left.
 - Offer the PLAITS machine to Modded-Cycles as a pull request.

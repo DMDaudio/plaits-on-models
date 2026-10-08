@@ -3211,7 +3211,6 @@ static void va_render(struct macro_va *__restrict v, const uint8_t *p, uint32_t 
 #define MODAL_LP_NEW (-1)
 
 /* x = m 2^(e - 30), m in [2^30, 2^31), or m = 0 for 0: 31-bit mantissas, so a product is one fmac1 on the EMAC */
-struct uf { int32_t m, e; };
 
 static inline struct uf uf_q(uint32_t v, int32_t q)               /* v / 2^q */
 {
@@ -3781,22 +3780,542 @@ static void string_render(struct macro_string *__restrict st, uint32_t *rng, con
     }
 }
 
+/* ---- 6-OP (Model-TG): plaits/dsp/engine2/six_op_engine.cc, plaits/dsp/fm/ (voice.h, operator.h, envelope.h,
+ * lfo.h, dx_units.h, algorithms.cc) ---------------------------------------------------------------------------- *
+ * Plaits' DX7 engine with its three factory banks as one: HARMONICS picks one of 96 patches, TIMBRE brightens the
+ * modulators, MORPH scales the envelope times. Two voices take the trigs in turn, rendered one per block over two
+ * blocks (Plaits' staggered rendering). The gate is a fixed pulse from each trig (DX7_GATE_BLOCKS).
+ * Operator outputs are phase offsets in turns, Q26 (Plaits quantizes them to 2^-26 too); amplitudes Q27; envelope
+ * levels Q24 (log2 units of 1/8); envelope phases Q30. */
+
+#include "macro_dx7.h"
+
+#ifndef DX7_GATE_BLOCKS
+#define DX7_GATE_BLOCKS 188                                         /* 125 ms: a 16th at 120 BPM (10 ms left the slow */
+#endif                                                              /* pads and strings of bank C nearly silent) */
+#define DX7_PREVIOUS (-0x7fffffff)                                  /* Envelope's PREVIOUS_LEVEL */
+#define DX7_LEVEL_67 112407347                                      /* 6.7, Q24 */
+
+/* Pow2Fast<1> and Pow2Fast<2> (the float tricks Plaits' FM code uses), x Q16 */
+static struct uf dx_pow2_1(int32_t x)
+{
+    struct uf r;
+    r.m = 0x40000000 + ((x & 0xffff) << 14);
+    r.e = x >> 16;
+    return r;
+}
+
+static struct uf dx_pow2_2(int32_t x)
+{
+    struct uf r;
+    int32_t f = (x & 0xffff) << 14;                                 /* Q30 */
+    r.m = 0x40000000 + fmac1(f, 1409889502 + (fmac1(f, 737673478) << 1));   /* 1 + f (0.6565 + 0.3435 f), Q30 */
+    r.e = x >> 16;
+    if (r.m < 0) {                                                  /* (f = 1: 2) */
+        r.m = 0x40000000;
+        r.e++;
+    }
+    return r;
+}
+
+static void dx_unpack(struct macro_dxpatch *p, int index)
+{
+    const uint8_t *d = &dx7_patches[index * 128];
+    int i, j;
+#define DXMIN(x, m) ((x) > (m) ? (m) : (x))
+    for (i = 0; i < 6; i++) {
+        const uint8_t *o = &d[i * 17];
+        struct macro_dxop_p *q = &p->op[i];
+        for (j = 0; j < 4; j++) {
+            q->rate[j] = DXMIN(o[j] & 0x7f, 99);
+            q->level[j] = DXMIN(o[4 + j] & 0x7f, 99);
+        }
+        q->bp = DXMIN(o[8] & 0x7f, 99);
+        q->ld = DXMIN(o[9] & 0x7f, 99);
+        q->rd = DXMIN(o[10] & 0x7f, 99);
+        q->lc = o[11] & 3;
+        q->rc = (o[11] >> 2) & 3;
+        q->rs = o[12] & 7;
+        q->ams = o[13] & 3;
+        q->vs = (o[13] >> 2) & 7;
+        q->out = DXMIN(o[14] & 0x7f, 99);
+        q->mode = o[15] & 1;
+        q->coarse = (o[15] >> 1) & 0x1f;
+        q->fine = DXMIN(o[16] & 0x7f, 99);
+        q->detune = DXMIN((o[12] >> 3) & 0xf, 14);
+    }
+    for (j = 0; j < 4; j++) {
+        p->prate[j] = DXMIN(d[102 + j] & 0x7f, 99);
+        p->plevel[j] = DXMIN(d[106 + j] & 0x7f, 99);
+    }
+    p->algorithm = d[110] & 0x1f;
+    p->feedback = d[111] & 7;
+    p->reset_phase = (d[111] >> 3) & 1;
+    p->lrate = DXMIN(d[112] & 0x7f, 99);
+    p->ldelay = DXMIN(d[113] & 0x7f, 99);
+    p->lpmd = DXMIN(d[114] & 0x7f, 99);
+    p->lamd = DXMIN(d[115] & 0x7f, 99);
+    p->lreset = d[116] & 1;
+    p->lwave = DXMIN((d[116] >> 1) & 7, 5);
+    p->lpms = d[116] >> 4;
+#undef DXMIN
+}
+
+static int dx_op_level(int level)                                   /* OperatorLevel */
+{
+    if (level < 20)
+        return level < 15 ? (level * (36 - level)) >> 3 : 27 + level;
+    return level + 28;
+}
+
+/* Envelope::Init(scale): the levels and increments Voice::Init leaves before a patch is set up */
+static void dx_env_init(struct macro_dxenv *e)
+{
+    int i;
+    e->stage = 3;
+    e->phase = 0x40000000;
+    e->start = 0;
+    for (i = 0; i < 4; i++) {
+        e->inc[i] = uf_q(1099512, 40);                              /* 0.001 (Voice::Render sets a patch up first) */
+        e->level[i] = (1 << 24) >> i;
+    }
+    e->level[3] = 0;
+}
+
+static int32_t dx_env_value(const struct macro_dxenv *e, int reshape)
+{
+    int32_t from = e->start == DX7_PREVIOUS ? e->level[(e->stage + 3) & 3] : e->start, to = e->level[e->stage];
+    int32_t ph = e->phase;
+    if (reshape && from < to) {
+        from = from < DX7_LEVEL_67 ? DX7_LEVEL_67 : from;
+        to = to < DX7_LEVEL_67 ? DX7_LEVEL_67 : to;
+        ph = fmac1(fmac1(ph, (5 << 28) - (ph >> 1)), 1431656448) << 2;   /* phase (2.5 - phase) 0.666667 */
+    }
+    return (fmac1(to - from, ph) << 1) + from;
+}
+
+/* Envelope::Render(gate, rate, ad_scale, release_scale) */
+static int32_t dx_env_render(struct macro_dxenv *e, int gate, struct uf rate, struct uf ad, struct uf rel, int reshape)
+{
+    uint32_t d;
+    if (gate) {
+        if (e->stage == 3) {
+            e->start = dx_env_value(e, reshape);
+            e->stage = 0;
+            e->phase = 0;
+        }
+    } else if (e->stage != 3) {
+        e->start = dx_env_value(e, reshape);
+        e->stage = 3;
+        e->phase = 0;
+    }
+    d = uf_to(uf_mul(uf_mul(e->inc[e->stage], rate), e->stage == 3 ? rel : ad), 30);
+    if (d >= (uint32_t)(0x40000000 - e->phase)) {
+        if (e->stage >= 2)
+            e->phase = 0x40000000;
+        else {
+            e->phase = 0;
+            e->stage++;
+        }
+        e->start = DX7_PREVIOUS;
+    } else
+        e->phase += (int32_t)d;
+    return dx_env_value(e, reshape);
+}
+
+/* PitchEnvelopeIncrement(rate): (1 + 192 r (r^4 + 0.3333)) / (21.3 x 44100), r = rate / 100 */
+static struct uf dx_pitch_inc(int rate)
+{
+    int32_t r = rate * 10737418;                                    /* Q30 */
+    int32_t r2 = fmac1(r, r) << 1, r4 = fmac1(r2, r2) << 1;
+    int32_t t = fmac1(r, r4 + 357878150) << 1;                     /* r (r^4 + 0.3333), Q30 */
+    struct uf v = uf_add(uf_q(1, 0), uf_mul(uf_q((uint32_t)t, 30), uf_q(192, 0)));
+    return uf_mul(v, uf_recip(uf_q(939330, 0)));
+}
+
+/* the envelopes, the ratios and the LFO for a patch (Voice::Setup and Lfo::Set) */
+static void dx_setup(struct macro_dxvoice *v)
+{
+    const struct macro_dxpatch *p = &v->p;
+    const struct uf scale = uf_mul(uf_q(44100, 0), uf_recip(uf_q(3063830, 6)));   /* 44100 / 47872.34 */
+    int i, j;
+    for (i = 0; i < 4; i++) {                                       /* PitchEnvelope::Set: PitchEnvelopeLevel */
+        int32_t l = (p->plevel[i] - 50) << 19, a = l + 335544, tail, x;   /* (level - 50) / 32, |l + 0.02|, Q24 */
+        a = a < 0 ? -a : a;
+        tail = a > (1 << 24) ? a - (1 << 24) : 0;
+        x = fmac1(fmac1(tail << 3, tail << 4), 1424211155) << 3;   /* 5.3056 tail^2 */
+        v->penv.level[i] = l + (fmac1(l << 4, x << 4) >> 1);       /* l (1 + 5.3056 tail^2) */
+    }
+    for (i = 0; i < 4; i++) {
+        int32_t from = v->penv.level[(i + 3) & 3], to = v->penv.level[i];
+        struct uf inc = dx_pitch_inc(p->prate[i]);
+        if (from != to) {
+            int32_t d = from > to ? from - to : to - from;
+            inc = uf_mul(inc, uf_recip(uf_q((uint32_t)d, 24)));
+        } else if (i != 3)
+            inc = uf_q(13421773, 26);                               /* 0.2 */
+        v->penv.inc[i] = uf_mul(inc, scale);
+    }
+    for (i = 0; i < 6; i++) {
+        const struct macro_dxop_p *o = &p->op[i];
+        struct macro_dxenv *e = &v->env[i];
+        int global = dx_op_level(o->out);
+        int32_t base;
+        for (j = 0; j < 4; j++) {                                   /* OperatorEnvelope::Set */
+            int ls = (dx_op_level(o->level[j]) & ~1) + global - 133;
+            e->level[j] = ls < 1 ? 1 << 20 : ls << 21;               /* 0.125 x (ls < 1 ? 0.5 : ls) */
+        }
+        for (j = 0; j < 4; j++) {
+            int rs = (o->rate[j] * 41) >> 6;
+            struct uf inc = uf_q((uint32_t)((4 + (rs & 3)) << (2 + (rs >> 2))), 24);
+            int32_t from = e->level[(j + 3) & 3], to = e->level[j];
+            if (from == to) {
+                inc = uf_mul(inc, uf_q(644245094, 30));             /* x 0.6 */
+                if (j == 0 && !o->level[j])
+                    inc = uf_mul(inc, uf_q(20, 0));
+            } else if (from < to) {
+                from = from < DX7_LEVEL_67 ? DX7_LEVEL_67 : from;
+                to = to < DX7_LEVEL_67 ? DX7_LEVEL_67 : to;
+                if (from == to)
+                    inc = uf_q(1, 0);
+                else
+                    inc = uf_mul(inc, uf_mul(uf_q(1932735283u, 28), uf_recip(uf_q((uint32_t)(to - from), 24))));
+            } else
+                inc = uf_mul(inc, uf_recip(uf_q((uint32_t)(from - to), 24)));
+            e->inc[j] = uf_mul(inc, scale);
+        }
+        v->headroom[i] = 127 - global;
+        /* FrequencyRatio */
+        if (o->mode == 0) {
+            base = dx7_coarse[o->coarse] + ((o->detune - 7) * 98304) / 100;
+            v->ratio[i] = uf_semis(base);
+            if (o->fine)
+                v->ratio[i] = uf_mul(v->ratio[i], uf_mul(uf_q(100 + o->fine, 0), uf_recip(uf_q(100, 0))));
+        } else {
+            base = ((o->coarse & 3) * 100 + o->fine) * 26125 + ((o->detune - 7) * 98304) / 100;   /* x 0.39864, Q16 */
+            v->ratio[i] = uf_mul(uf_semis(base), uf_recip(uf_q(3063830, 6)));   /* Hz / 47872.34 (fixed) */
+        }
+    }
+    /* Lfo::Set */
+    {
+        int rs = p->lrate == 0 ? 1 : (p->lrate * 165) >> 6, d;
+        rs *= rs < 160 ? 11 : 11 + ((rs - 160) >> 4);
+        v->lfreq = uf_to(uf_mul(uf_q((uint32_t)rs, 0), uf_q(8621109, 46)), 32);   /* x 0.005865 / 47872.34, Q32 */
+        if (p->ldelay == 0)
+            v->ldinc[0] = v->ldinc[1] = 0x7fffffff;
+        else {
+            d = 99 - p->ldelay;
+            d = (16 + (d & 15)) << (1 + (d >> 4));
+            v->ldinc[0] = uf_to(uf_mul(uf_q((uint32_t)d, 0), uf_q(8621109, 46)), 31);
+            v->ldinc[1] = uf_to(uf_mul(uf_q((uint32_t)(d & 0xff80 ? d & 0xff80 : 0x80), 0), uf_q(8621109, 46)), 31);
+        }
+        v->amd = p->lamd * 10737418;                                /* Q30 */
+        v->pmd = fmac1(p->lpmd * 21474836, dx7_pms[p->lpms]);       /* amd 0.01 x pms, Q29 */
+    }
+}
+
+/* Lfo::Step(scale) */
+static void dx_lfo_step(struct macro_dxvoice *v, uint32_t *rng, int scale)
+{
+    uint32_t old = v->lph, ph, dp;
+    int32_t val;
+    v->lph += v->lfreq * (uint32_t)scale;
+    if (v->lph < old)
+        v->lrand = (int32_t)(rnd32(rng) >> 2);                      /* GetFloat(), Q30 */
+    ph = v->lph;
+    switch (v->p.lwave) {
+    case 0: val = (int32_t)((ph < 0x80000000u ? 0x80000000u - ph : ph - 0x80000000u) >> 1); break;
+    case 1: val = (int32_t)((0u - ph) >> 2) + (ph ? 0 : 0x40000000); break;
+    case 2: val = (int32_t)(ph >> 2); break;
+    case 3: val = ph < 0x80000000u ? 0 : 0x40000000; break;
+    case 4: {
+        uint32_t q = ph + 0x80000000u, i = q >> 23;
+        val = (0x40000000 + dx7_sine[i] + fmac1(dx7_sine[i + 1] - dx7_sine[i], (int32_t)((q << 9) >> 1))) >> 1;
+        break;
+    }
+    default: val = v->lrand; break;
+    }
+    v->lval = val;
+    dp = v->ldinc[v->ldp < 0x40000000u ? 0 : 1];
+    v->ldp = dp >= (0x80000000u - v->ldp) / (uint32_t)scale ? 0x80000000u : v->ldp + dp * (uint32_t)scale;
+}
+
+/* (pitch_mod, Q27; amp_mod, Q28) from a voice's LFO */
+static void dx_lfo_mods(const struct macro_dxvoice *l, int32_t *pm, int32_t *am)
+{
+    int32_t ramp = l->ldp < 0x40000000u ? 0 : (int32_t)(l->ldp - 0x40000000u);   /* Q30 */
+    *pm = fmac1(fmac1(l->lval - 0x20000000, ramp), l->pmd);
+    *am = fmac1(fmac1(0x40000000 - l->lval, ramp), l->amd);
+}
+
+/* RenderOperators<1, src, add>, one operator: src -2 the input buffer, -1 none, 0 its own feedback. Written for
+ * constant src and add, so each call site below gets its own loop. */
+static inline __attribute__((always_inline)) void dx_op1(struct macro_dxop *op, uint32_t f, int32_t a, const int src,
+                                                       const int add, int32_t *fb, int fbamt, const int32_t *in,
+                                                       int32_t *out, int size)
+{
+    uint32_t ph = op->phase;
+    int32_t amp = op->amp, ai, p0 = fb[0], p1 = fb[1], i, sh = 9 - fbamt;
+    ai = ((a > 1 << 29 ? 1 << 29 : a) - amp) / size;
+    for (i = 0; i < size; i++) {
+        int32_t pm = src == -2 ? in[i] : src == 0 ? (fbamt ? (p0 + p1) >> sh : 0) : 0, j, s;
+        uint32_t x;
+        ph += f;
+        x = ph + ((uint32_t)pm << 6);
+        j = (int32_t)(x >> 23);
+        s = dx7_sine[j] + fmac1(dx7_sine[j + 1] - dx7_sine[j], (int32_t)((x << 9) >> 1));
+        pm = fmac1(s, amp);
+        amp += ai;
+        if (src == 0) {
+            p1 = p0;
+            p0 = pm;
+        }
+        out[i] = add ? out[i] + pm : pm;
+    }
+    op->phase = ph;
+    op->amp = amp;
+    if (src == 0) {
+        fb[0] = p0;
+        fb[1] = p1;
+    }
+}
+
+/* RenderOperators<n, modulation_source, additive> */
+static void dx_ops(struct macro_dxop *ops, const uint32_t *f, const int32_t *a, int n, int src, int add, int32_t *fb,
+                   int fbamt, const int32_t *in, int32_t *out, int size)
+{
+    uint32_t ph[3], fr[3];
+    int32_t amp[3], ai[3], p0 = fb[0], p1 = fb[1], i, k;
+    for (k = 0; k < n; k++) {
+        int32_t t = a[k] > 1 << 29 ? 1 << 29 : a[k];
+        fr[k] = f[k];
+        ph[k] = ops[k].phase;
+        amp[k] = ops[k].amp;
+        ai[k] = (t - amp[k]) / size;
+    }
+    for (i = 0; i < size; i++) {
+        int32_t pm = src >= 0 ? (fbamt ? (p0 + p1) >> (9 - fbamt) : 0) : src == -2 ? in[i] : 0;
+        for (k = 0; k < n; k++) {
+            uint32_t x;
+            int32_t j, s;
+            ph[k] += fr[k];
+            x = ph[k] + ((uint32_t)pm << 6);                        /* SinePM: the phase plus pm turns */
+            j = (int32_t)(x >> 23);
+            s = dx7_sine[j] + fmac1(dx7_sine[j + 1] - dx7_sine[j], (int32_t)((x << 9) >> 1));
+            pm = fmac1(s, amp[k]);                                  /* Q30 x Q27 -> Q26 */
+            amp[k] += ai[k];
+            if (k == src) {
+                p1 = p0;
+                p0 = pm;
+            }
+        }
+        out[i] = add ? out[i] + pm : pm;
+    }
+    for (k = 0; k < n; k++) {
+        ops[k].phase = ph[k];
+        ops[k].amp = amp[k];
+    }
+    if (src >= 0) {
+        fb[0] = p0;
+        fb[1] = p1;
+    }
+}
+
+/* KeyboardScaling(note, ks), note Q16; level units Q16 */
+static int32_t dx_kb(const struct macro_dxop_p *o, int32_t note)
+{
+    int32_t x = note - ((o->bp + 15) << 16), curve = x > 0 ? o->rc : o->lc, t = x < 0 ? -x : x;
+    if (curve == 1 || curve == 2) {
+        t = fmac1(t, 22478137);                                     /* x 0.010467 */
+        t = t > 65536 ? 65536 : t;
+        t = (int32_t)(((((uint32_t)t * (uint32_t)t) >> 16) * (uint32_t)t) >> 16) * 96;
+    }
+    if (curve < 2)
+        t = -t;
+    return fmac1(t * (x > 0 ? o->rd : o->ld), 57488186);            /* x depth x 0.02677 */
+}
+
+/* Voice::Render over size samples into the three buffers b (out, then two scratch) */
+static void dx_voice_render(struct macro_dxvoice *v, int32_t *b, int size)
+{
+    const struct macro_dxpatch *p = &v->p;
+    const struct dx7_call *c = dx7_algs[p->algorithm];
+    struct uf rate = uf_q((uint32_t)size, 0), ad, rel, f0;
+    int32_t ec = v->ectl, pitch, semis, i, note;
+    uint32_t f[6];
+    int32_t a[6];
+    int32_t *buf[4];
+    if (v->patch < 0)
+        return;
+    if (v->dirty) {                                                 /* Setup(): the block it runs in stays silent */
+        dx_setup(v);
+        v->dirty = 0;
+        return;
+    }
+    ad = dx_pow2_1((32768 - ec) * 8);
+    rel = dx_pow2_1(-(ec > 19661 ? ec - 19661 : 19661 - ec) * 8);
+    pitch = dx_env_render(&v->penv, v->gate, rate, ad, rel, 0) + (v->pitch_mod >> 3);   /* Q24 */
+    semis = (int32_t)(((pitch >> 4) * 12) >> 4);                    /* x 12, Q16 */
+    f0 = uf_q(va_freq(v->inc, semis), 32);
+    if (v->gate && !v->gate_) {
+        v->note = (69 << 16) + (log2_q16(v->inc) - NOTE_L0) * 12;   /* Q16, on Plaits' pitch scale */
+        v->nvel = DX7_NVEL;
+        if (p->reset_phase)
+            for (i = 0; i < 6; i++)
+                v->op[i].phase = 0;
+    }
+    v->gate_ = v->gate;
+    note = v->note;
+    for (i = 0; i < 6; i++) {
+        const struct macro_dxop_p *o = &p->op[i];
+        int32_t level, sum, lm, x;
+        uint32_t t;
+        t = uf_to(o->mode == 0 ? uf_mul(v->ratio[i], f0) : v->ratio[i], 32);
+        f[i] = t > 0x80000000u ? 0x80000000u : t;
+        level = dx_env_render(&v->env[i], v->gate,
+                              uf_mul(rate, dx_pow2_1((o->rs * ((note / 3) - (7 << 16))) >> 5)), ad, rel, 1);
+        sum = dx_kb(o, note) + v->nvel * o->vs + ((dx7_modulators[p->algorithm] >> i) & 1 ? (v->bright - 32768) * 32 : 0);
+        level += (sum < v->headroom[i] << 16 ? sum : v->headroom[i] << 16) << 5;
+        lm = (fmac1(dx7_ams[o->ams], v->amp_mod) >> 11) - 65536;   /* sensitivity x amp_mod - 1, Q16 */
+        lm = 0x40000000 - (int32_t)uf_to(dx_pow2_2(lm * 64 / 10), 30);   /* 1 - 2^(6.4 x that), Q30 */
+        x = -(14 << 16) + (fmac1(level, lm) >> 7);                  /* -14 + level x level_mod, Q16 */
+        t = uf_to(dx_pow2_2(x), 27);
+        a[i] = t > 1u << 29 ? 1 << 29 : (int32_t)t;
+    }
+    buf[0] = b;
+    buf[1] = b + size;
+    buf[2] = buf[3] = b + 2 * size;
+    for (i = 0; i < 6 && c[i].op >= 0; i++) {
+        int k = c[i].op;
+        int32_t *o = buf[c[i].out];
+        const int32_t *in = buf[c[i].in];
+        if (c[i].n == 1) {                                          /* (the usual case) */
+            int sel = (c[i].src + 2) * 2 + c[i].add;
+            switch (sel) {
+            case 0: dx_op1(&v->op[k], f[k], a[k], -2, 0, v->fb, p->feedback, in, o, size); break;
+            case 1: dx_op1(&v->op[k], f[k], a[k], -2, 1, v->fb, p->feedback, in, o, size); break;
+            case 2: dx_op1(&v->op[k], f[k], a[k], -1, 0, v->fb, p->feedback, in, o, size); break;
+            case 3: dx_op1(&v->op[k], f[k], a[k], -1, 1, v->fb, p->feedback, in, o, size); break;
+            case 4: dx_op1(&v->op[k], f[k], a[k], 0, 0, v->fb, p->feedback, in, o, size); break;
+            default: dx_op1(&v->op[k], f[k], a[k], 0, 1, v->fb, p->feedback, in, o, size); break;
+            }
+        } else
+            dx_ops(&v->op[k], &f[k], &a[k], c[i].n, c[i].src, c[i].add, v->fb, p->feedback, in, o, size);
+    }
+}
+
+static COLD void dx_voice_init(struct macro_dxvoice *v)
+{
+    int i;
+    for (i = 0; i < 6; i++)
+        dx_env_init(&v->env[i]);
+    dx_env_init(&v->penv);
+    v->patch = -1;
+    v->note = 48 << 16;
+    v->inc = 0;
+    v->bright = v->ectl = 32768;
+    v->nvel = 10 << 16;                                             /* Voice::Init's normalized_velocity_ */
+}
+
+static COLD void sixop_init(struct macro_sixop *x)
+{
+    int32_t *w = (int32_t *)x, *end = (int32_t *)(x + 1);
+    while (w < end)
+        *w++ = 0;
+    dx_voice_init(&x->v[0]);
+    dx_voice_init(&x->v[1]);
+    x->active = 1;
+}
+
+static void sixop_render(struct macro_sixop *__restrict x, uint32_t *rng, const uint8_t *p, uint32_t inc,
+                         int32_t *__restrict out, int32_t *__restrict aux, int n)
+{
+    int32_t timb = k16(p[MACRO_P_TIMB]), morph = k16(p[MACRO_P_MORPH]), idx, i, gate;
+    struct macro_dxvoice *act;
+#ifdef DX7_BANK                                                     /* tests: one bank, Plaits' quantizer */
+    {
+        int32_t v = ((k16(p[MACRO_P_HARM]) * 32) * 51 / 50) - 32768;   /* HARMONICS x 1.02 x 32 - 0.5, Q16 */
+        int32_t q = (v + (v > x->quant << 16 ? -328 : 328) + 32768) >> 16;
+        x->quant = q < 0 ? 0 : q > 31 ? 31 : q;
+        idx = DX7_BANK * 32 + x->quant;
+    }
+#else
+    idx = (p[MACRO_P_HARM] * 3) >> 2;                               /* 96 patches over 0..127 */
+#endif
+    if (x->trig) {
+        x->trig = 0;
+        x->active ^= 1;
+        act = &x->v[x->active];
+        if (act->patch != idx) {                                    /* FMVoice::LoadPatch */
+            act->patch = idx;
+            dx_unpack(&act->p, idx);
+            act->dirty = 1;
+            dx_setup(act);                                          /* (for the LFO's Set; Setup() redoes the rest) */
+            act->dirty = 1;
+        }
+        if (act->p.lreset)                                          /* Lfo::Reset */
+            act->lph = 0;
+        act->ldp = 0;
+        x->gate = DX7_GATE_BLOCKS;
+    }
+    act = &x->v[x->active];
+    gate = x->gate > 0;
+    if (x->gate > 0)
+        x->gate--;
+    act->inc = inc;
+    act->ectl = morph;
+    dx_lfo_step(act, rng, n);
+    for (i = 0; i < 2; i++) {
+        struct macro_dxvoice *v = &x->v[i];
+        v->bright = timb;
+        v->gate = gate && v == act;
+        if (v->patch != act->patch) {
+            dx_lfo_step(v, rng, n);
+            dx_lfo_mods(v, &v->pitch_mod, &v->amp_mod);
+        } else
+            dx_lfo_mods(act, &v->pitch_mod, &v->amp_mod);
+    }
+    /* staggered: one voice a block, over this block and the next */
+    for (i = 0; i < n; i++) {
+        x->tmp[i] = x->acc[i];
+        x->tmp[n + i] = 0;
+    }
+    x->rendered ^= 1;
+    dx_voice_render(&x->v[x->rendered], x->tmp, 2 * n);
+    for (i = 0; i < n; i++) {                                       /* SoftClip(x / 4), Q15 */
+        int32_t s = x->tmp[i] >> 4, x2, num, den, r;                /* Q24 */
+        if (s > 3 << 24)
+            s = 1 << 24;
+        else if (s < -(3 << 24))
+            s = -(1 << 24);
+        else {
+            x2 = fmac1(s << 3, s << 3);                             /* Q23 */
+            num = (27 << 23) + x2;
+            den = (27 << 23) + 9 * x2;
+            r = (int32_t)(((uint32_t)num << 3) / ((uint32_t)den >> 13));   /* (27 + x^2) / (27 + 9 x^2), Q16 */
+            s = fmac1(s, r >= 65536 ? 0x7fffffff : r << 15);
+        }
+        out[i] = aux[i] = (s + 256) >> 9;
+        x->acc[i] = x->tmp[n + i];
+    }
+}
+
 /* the gains Plaits' voice gives each engine's OUT and AUX (voice.cc, RegisterInstance), Q15. An engine
  * Plaits registers with a negative gain goes through its limiter (limit()) and then 0.8. */
-static const int16_t gain_out[MACRO_ENGINES] = {22938, 19661, 26214, 26214, 26214, 26214, 26214, 22938, 26214, 26214, 19661, 26214, 26214, 26214};  /* WSH .7, FM .6, NOISE, PART lim; drums .8; GRAIN .7 */
-static const int16_t gain_aux[MACRO_ENGINES] = {19661, 19661, 26214, 32767, 26214, 26214, 26214, 19661, 26214, 32767, 19661, 26214, 26214, 26214};  /* WSH .6, FM .6, NOISE lim, PART 1; drums .8; GRAIN .6 */
+static const int16_t gain_out[MACRO_ENGINES] = {22938, 19661, 26214, 26214, 26214, 26214, 26214, 22938, 26214, 26214, 19661, 26214, 26214, 26214, 32767};  /* WSH .7, FM .6, NOISE, PART lim; drums .8; GRAIN .7 */
+static const int16_t gain_aux[MACRO_ENGINES] = {19661, 19661, 26214, 32767, 26214, 26214, 26214, 19661, 26214, 32767, 19661, 26214, 26214, 26214, 32767};  /* WSH .6, FM .6, NOISE lim, PART 1; drums .8; GRAIN .6 */
 
-const char *const macro_engine_name[MACRO_ENGINES] = {"WSHAPE", "2OP FM", "NOISE", "PARTCL", "BDRUM", "SNARE", "HIHAT", "GRAIN", "CHORDS", "SWARM", "WAVES", "VA", "MODAL", "STRING"};
+const char *const macro_engine_name[MACRO_ENGINES] = {"WSHAPE", "2OP FM", "NOISE", "PARTCL", "BDRUM", "SNARE", "HIHAT", "GRAIN", "CHORDS", "SWARM", "WAVES", "VA", "MODAL", "STRING", "6-OP"};
 
 /* Model-TG: which engines are built in, and their order on the ENGN knob. MACRO_SEL is a list of MACRO_*
  * ids (build.py --plaits-engines); an engine not in it is never called, so its code and tables are not
  * linked. Knob zone k (8 values each) plays the k-th engine of the list; past the last, the last. */
 #ifndef MACRO_SEL
 #define MACRO_SEL MACRO_WSH, MACRO_FM, MACRO_NOISE, MACRO_PARTICLE, MACRO_BD, MACRO_SD, MACRO_HH, MACRO_GRAIN, \
-                  MACRO_CHORD, MACRO_SWARM, MACRO_WAVETABLE, MACRO_VA, MACRO_MODAL, MACRO_STRING
+                  MACRO_CHORD, MACRO_SWARM, MACRO_WAVETABLE, MACRO_VA, MACRO_MODAL, MACRO_STRING, MACRO_SIXOP
 #endif
 #ifndef MACRO_MASK                     /* bit e set: engine e is in MACRO_SEL (build.py passes both) */
-#define MACRO_MASK 0x3fff
+#define MACRO_MASK 0x7fff
 #endif
 static const uint8_t macro_sel[] = { MACRO_SEL };
 #define MACRO_NSEL ((int)sizeof macro_sel)
@@ -3826,6 +4345,7 @@ static void engine_init(struct macro_voice *m)
     case MACRO_VA: if (HAS(MACRO_VA)) va_init(&m->e.va); break;
     case MACRO_MODAL: if (HAS(MACRO_MODAL)) modal_init(&m->e.modal); break;
     case MACRO_STRING: if (HAS(MACRO_STRING)) string_init(&m->e.string); break;
+    case MACRO_SIXOP: if (HAS(MACRO_SIXOP)) sixop_init(&m->e.sixop); break;
     default: break;
     }
 }
@@ -3885,6 +4405,8 @@ static void macro_render_e(struct macro_voice *m, const uint8_t *p, uint32_t inc
             m->e.modal.trig = 1;
         if (HAS(MACRO_STRING) && m->engine == MACRO_STRING)
             m->e.string.trig = 1;
+        if (HAS(MACRO_SIXOP) && m->engine == MACRO_SIXOP)
+            m->e.sixop.trig = 1;
     }
     if (inc > INC_MAX)
         inc = INC_MAX;
@@ -3918,6 +4440,10 @@ static void macro_render_e(struct macro_voice *m, const uint8_t *p, uint32_t inc
     case MACRO_GRAIN:
         if (!HAS(MACRO_GRAIN)) goto none;
         grain_render(&m->e.grain, p, inc, o, a, n, mix < 32767, mix > 0);
+        break;
+    case MACRO_SIXOP:
+        if (!HAS(MACRO_SIXOP)) goto none;
+        sixop_render(&m->e.sixop, &m->rng, p, inc, o, a, n);
         break;
     case MACRO_STRING:
         if (!HAS(MACRO_STRING)) goto none;

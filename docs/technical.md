@@ -34,6 +34,10 @@ PARTICLE, BDRUM, SNARE, HIHAT and GRAIN in 32-bit integer C, checked against Pla
 - **STRING** (`string_engine.cc`, `string_voice.cc`, `string.cc`): three delay-line strings, 1024 + 256 samples
   each, with a DC blocker, a damping low-pass, Hermite reads, and either a curved bridge or an allpass dispersion
   driven by noise. It draws its random numbers in the same order as Plaits, so it can be compared sample by sample.
+- **6-OP** (`engine2/six_op_engine.cc`, `fm/`): two voices of six operators, 32 algorithms (the render calls dumped from
+  Plaits' own `Algorithms<6>::Compile()`), DX7 envelopes, pitch envelope, LFO, keyboard and rate scaling, and the 96
+  factory patches unpacked on demand. Operator outputs are phase offsets in turns, Q26. Single operators get
+  specialised loops.
 - **Engine selection** (`MACRO_SEL`, `MACRO_MASK`): engines left out are not linked.
 
 Conventions follow MACRO: 32-bit phases, Q15 signals, knob values 0..127, no 64-bit arithmetic and no library calls
@@ -56,6 +60,7 @@ Each new engine was compared with Plaits' own source compiled for a PC, at the s
 | VA | 8,736 | -67.4 dB | -78.8 dB / -11.9 dB (see below) |
 | MODAL | 8,736 | -70.1 dB | -46.6 dB / -13.4 dB (see below) |
 | STRING | 8,736 | -64.2 dB | -66.0 dB / see below |
+| 6-OP bank A / B / C | 8,736 each | -68.5 / -71.1 / -49.6 dB | -69.8 / -63.7 / -45.4 dB |
 | SWARM | 2,100 | (chaotic) | band levels: median 0.3 dB, worst 22.7 dB; float Plaits: 0.0 / 23.4 dB |
 
 The remaining CHORDS outliers are the OCT and 5 chords at the top inversion. Float Plaits rounds to inversion 20 there,
@@ -82,6 +87,14 @@ MODAL's and STRING's worst cases sit where Plaits is itself unstable: modes with
 the top of the band, and the lowest notes of STRING with full dispersion and endless decay. There, float Plaits
 and double Plaits differ by -20 to -40 dB, as much as the port does.
 
+6-OP is checked against float Plaits: compiled with `float` as `double`, Plaits' `Pow2Fast` (which builds a float's
+exponent bits through a union) returns nonsense. Its worst cases are bright, feedback-heavy patches that are chaotic
+in Plaits itself: moving the note by 0.01 semitone changes Plaits' own output by -1 to -7 dB there.
+
+One behaviour of Plaits is not reproduced: `Lfo::Init` leaves the LFO running at 0.1 cycle a sample until a patch is
+loaded, so a voice that has not played yet runs its LFO phase up without bound and has a garbage LFO for its first
+note. In the port an idle voice's LFO stands still (the reference harness is patched the same way to compare).
+
 Two things in the reference harness matter for anyone redoing this: Plaits sizes its engines' scratch buffers for
 24 samples (`kMaxBlockSize`), so a reference rendering 32-sample blocks must give STRING its own buffer, or the
 overflow lands in the first string's delay line; and the engines limited by the voice (MODAL, STRING) must go
@@ -91,9 +104,9 @@ through the same `stmlib::Limiter` on both sides.
 
 The PLAITS machine uses the added-machine mechanism of Modded-Cycles (as its Braids MACRO): relocated machine,
 name, descriptor and knob tables, a dispatch detour that sends machine 8 to PLAITS and the others to Model-TG, and a
-payload copied at boot to 0x46700000 (the top of Model-TG's sample region, given up for it). The engines take 115 KB
+payload copied at boot to 0x46700000 (the top of Model-TG's sample region, given up for it). The engines take 147 KB
 of code and tables, and 92 KB of variables for six voices (mostly STRING's delay lines), which the boot hook zeroes
-and which take no room in the image. With Model-TG and 6-channel USB the decompressed OS ends at 0x401ddc50, under
+and which take no room in the image. With Model-TG and 6-channel USB the decompressed OS ends at 0x401e4db8, under
 the bootstrap's 0x40200000 limit.
 
 CPU, in instructions per 32-sample block of the whole voice loop with one PLAITS track (166,667 cycles a block):
@@ -105,6 +118,7 @@ CPU, in instructions per 32-sample block of the whole voice loop with one PLAITS
 | VA | 5.8 % | 6.0 % |
 | MODAL | 14.3 % | 21.6 % while a knob moves |
 | STRING | 12.3 % | 12.6 % |
+| 6-OP | 6.6 % | 10.7 % (12.1 % while a knob moves) |
 | BDRUM | 5.2 % | 8.0 % |
 | GRAIN | 5.3 % | 5.4 % |
 | CHORDS | 11.5 % | 11.5 % |

@@ -16,7 +16,8 @@ c++ -O2 -DTEST -w -include dbl.h -I$ER chord_ref.cc $ER/plaits/dsp/engine/chord_
 # same for swarm_ref.cc (engine/swarm_engine.cc), wt_ref.cc (engine/wavetable_engine.cc)
 # va_ref.cc (engine/virtual_analog_engine.cc), modal_ref.cc (engine/modal_engine.cc,
 # physical_modelling/modal_voice.cc, resonator.cc) and string_ref.cc (engine/string_engine.cc,
-# physical_modelling/string_voice.cc, string.cc)
+# physical_modelling/string_voice.cc, string.cc). sixop_ref.cc takes a bank (0..2) first and is built from
+# engine2/six_op_engine.cc, fm/algorithms.cc and fm/dx_units.cc; use it in float (see below)
 ```
 
 ## Comparisons
@@ -27,6 +28,7 @@ python3 compare.py --wavetable     # WAVETABLE, 8,736 cases
 python3 compare.py --va            # VA, 8,736 cases
 python3 compare.py --modal         # MODAL, 8,736 cases: a trig at 0 and at 0.5 s, compared after the second
 python3 compare.py --string        # STRING, the same
+python3 compare.py --sixop --bank 0 --float   # 6-OP, one bank at a time, against float Plaits
 python3 swarm_compare.py           # SWARM, 2,100 cases, by band levels
 ```
 
@@ -50,3 +52,6 @@ c++ -O1 -w -DTEST -include dbl.h -I$ER -I../engines wt_test.cc $ER/plaits/resour
 `feasibility/` builds unchanged Plaits for the ColdFire (software float, and an FPU variant as a proxy for a
 fixed-point port) and counts instructions per block in Unicorn. Results in `softfloat.txt` and `fpu-estimate.txt`.
 The scripts expect the eurorack clone at `../../repos/eurorack`; edit `ER=` in `build.sh` otherwise.
+
+6-OP is compared against float Plaits only: built with `dbl.h`, Plaits' `Pow2Fast` (which sets a float's exponent
+bits through a union) gives wrong amplitudes.

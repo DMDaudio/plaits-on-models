@@ -18,6 +18,7 @@
    | 7 | WAVES |
    | 8 | MODAL |
    | 9 | STRING |
+   | 10 | 6-OP |
 
 4. COLOR, SWEEP and CONTOUR are Plaits' three macro controls: HARMONICS, TIMBRE and MORPH.
 
@@ -41,6 +42,7 @@ hold **Preset** and turn DECAY, SWEEP or CONTOUR for Attack, Filter and Resonanc
 | SWARM | pitch spread of the eight voices | grain density | grain size: small sizes become glissandi |
 | WAVES | bank (four, mirrored; in the upper half the position snaps to whole waves) | X position on the 8x8 grid | Y position on the grid |
 | MODAL | material: bell-like partials at the left, a harmonic series in the middle, stretched partials to the right | brightness of the strike | decay |
+| 6-OP | the patch: 96 of them, one or two knob steps each (0-31 basses, synths and leads; 32-63 pianos, keys, mallets, bells and drums; 64-95 organs, pads, strings and brass; COLOR x 3/4 is the number) | brightness: louder modulators | envelope times: shorter to the left, longer to the right |
 | STRING | left of the middle a curved bridge (a sitar-like buzz), a plain string in the middle, to the right more and more dispersion (stretched, piano-like, then rough) | brightness of the pluck | decay, endless at the top |
 
 Notes on some engines:
@@ -48,6 +50,9 @@ Notes on some engines:
 - **BDRUM**, **MODAL** and **STRING** make their own envelope from each trig. Set DECAY long and let the engine shape
   the sound.
 - **STRING** plucks three strings in turn, so a note keeps ringing while the next ones play, as on the module.
+- **6-OP** plays each trig as a 125 ms gate (the module holds the gate while its trigger input is high): sustaining
+  patches release after that, at their own release rate. The slowest pads need CONTOUR below the middle, which
+  shortens attacks, to speak quickly. Two voices take the trigs in turn, so a note's release overlaps the next.
 - **FM** with feedback runs four times oversampled from the start of a note. Moving CONTOUR during a note keeps the
   rate the note started with, so there are no clicks.
 - **SWARM**: every trig starts a burst. The grains slow down after it, as with a patched trigger on the module.

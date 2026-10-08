@@ -23,6 +23,7 @@ risk. No firmware is distributed here: you build it from your own copy of the of
 | 7 | WAVES | 8x8x4 wavetable |
 | 8 | MODAL | modal resonator: struck bells, bars and plates |
 | 9 | STRING | inharmonic string: plucked, buzzing or piano-like strings |
+| 10 | 6-OP | 6-operator FM with the 96 factory patches of Plaits' three banks (DX7 format) |
 
 Controls on the PLAITS machine:
 

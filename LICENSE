@@ -26,8 +26,10 @@ Third-party code in this repository keeps its own licence and notices:
 
 - engines/macro.c, macro.h, macro_tables.h: Plaits synthesis by Emilie Gillet
   (Copyright 2016, MIT) as ported to fixed point by the digi1_mods authors (MIT).
-  See the header of macro.c. The CHORDS, SWARM, WAVETABLE, VA, MODAL and STRING engines in macro.c
+  See the header of macro.c. The CHORDS, SWARM, WAVETABLE, VA, MODAL, STRING and 6-OP engines in macro.c
   and the engine selection are additions made here, under the same terms.
+  engines/macro_dx7.h holds Plaits' three factory FM banks and tables (MIT), generated
+  by engines/tools/gen_dx7_tables.py.
 - engines/macro_chord_tables.h, macro_wavetable.h: data generated from Plaits
   (pichenettes/eurorack, MIT).
 - model-tg-sampler-mode/model-tg-plaits-mode.patch: changes to Model-TG

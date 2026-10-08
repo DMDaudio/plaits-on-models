@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The fixed-point CHORD (Model-TG src/macro/macro.c) against Plaits' float ChordEngine (chord_ref), same knobs
 (k/127), same f0, 32-sample blocks, after the knobs' one-pole has settled (0.5 s): the difference's level under
-the reference's RMS, OUT and AUX.  usage: compare.py [--quick] [--wavetable | --va | --modal | --string] [--float]"""
+the reference's RMS, OUT and AUX.  usage: compare.py [--quick] [--float] [--wavetable | --va | --modal | --string | --sixop [--bank B]]"""
 import ctypes, itertools, pathlib, subprocess, sys, tempfile
 import numpy as np
 HERE = pathlib.Path(__file__).resolve().parent
@@ -12,12 +12,16 @@ WT = "--wavetable" in sys.argv                                   # WAVETABLE ins
 VA = "--va" in sys.argv                                          # VA instead of CHORD
 MODAL = "--modal" in sys.argv                                    # MODAL: a trig at 0 and at the half, compared after it
 STRING = "--string" in sys.argv                                  # STRING: the same
+SIXOP = "--sixop" in sys.argv                                    # 6-OP: the same, bank --bank B (0..2), a 15-block gate
+BANK = int(sys.argv[sys.argv.index("--bank") + 1]) if "--bank" in sys.argv else 0
 SEL, MASK = (("MACRO_WAVETABLE", "0x400") if WT else ("MACRO_VA", "0x800") if VA else ("MACRO_MODAL", "0x1000") if MODAL
-             else ("MACRO_STRING", "0x2000") if STRING else ("MACRO_CHORD", "0x100"))
-EVERY = N // 64 if MODAL or STRING else 1 << 30                  # blocks between trigs
-REF = ("wt_ref" if WT else "va_ref" if VA else "modal_ref" if MODAL else "string_ref" if STRING else "chord_ref") + ("" if "--float" in sys.argv else "_d")   # default: Plaits in double
+             else ("MACRO_STRING", "0x2000") if STRING else ("MACRO_SIXOP", "0x4000") if SIXOP else ("MACRO_CHORD", "0x100"))
+EVERY = N // 64 if MODAL or STRING or SIXOP else 1 << 30         # blocks between trigs
+REF = ("wt_ref" if WT else "va_ref" if VA else "modal_ref" if MODAL else "string_ref" if STRING else
+       "sixop_ref" if SIXOP else "chord_ref") + ("" if "--float" in sys.argv else "_d")   # default: Plaits in double
+GAIN = 0.6 if WT else 1.0 if SIXOP else 0.8                      # the voice's gain for the engine
 lib = pathlib.Path(tempfile.mkdtemp()) / "m.so"
-subprocess.run(["cc", "-O2", "-w", "-shared", "-fPIC", "-DMACRO_SEL=" + SEL, "-DMACRO_MASK=" + MASK, "-DCHORD_BLOCK=32", "-DCHORD_FROM_ZERO", "-DWT_BLOCK=32", "-DWT_FROM_ZERO", "-DMODAL_BLOCK=32", "-DMODAL_FROM_ZERO",
+subprocess.run(["cc", "-O2", "-w", "-shared", "-fPIC", "-DMACRO_SEL=" + SEL, "-DMACRO_MASK=" + MASK, "-DCHORD_BLOCK=32", "-DCHORD_FROM_ZERO", "-DWT_BLOCK=32", "-DWT_FROM_ZERO", "-DMODAL_BLOCK=32", "-DMODAL_FROM_ZERO", "-DDX7_BANK=%d" % BANK, "-DDX7_GATE_BLOCKS=15",
                 str(SRC / "macro.c"), "-o", str(lib)], check=True)
 m = ctypes.CDLL(str(lib))
 m.macro_render.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_int16), ctypes.c_int]
@@ -37,7 +41,8 @@ def ours(inc, h, t, mo, aux):
 
 def ref(note, h, t, mo):
     k16 = lambda k: repr(((k * 33026) >> 6) / 65536)      # exactly the knob value the port uses
-    r = subprocess.run([str(HERE / REF), str(note), k16(h), k16(t), k16(mo), str(N)] + ([str(EVERY)] if MODAL or STRING else []), capture_output=True)
+    r = subprocess.run([str(HERE / REF)] + ([str(BANK)] if SIXOP else []) + [str(note), k16(h), k16(t), k16(mo), str(N)] +
+                       ([str(EVERY)] if MODAL or STRING or SIXOP else []) + (["15"] if SIXOP else []), capture_output=True)
     if r.returncode:            # double Plaits reaching a grid position of exactly 7.0 reads past its wave bank
         r = subprocess.run([str(HERE / REF.replace("_d", "")), str(note), k16(h), k16(t), k16(mo), str(N)],
                            capture_output=True)
@@ -62,7 +67,7 @@ for note, h, t, mo in itertools.product(notes, hs, ts, ms):
     inc = int(round(f0 * 2 ** 32))
     for name, r, aux in (("OUT", ro, 0), ("AUX", ra, 127)):
         x = ours(inc, h, t, mo, aux)[N // 2:]
-        y = np.clip(np.round(r[N // 2:] * (0.6 if WT else 0.8) * 32768), -32768, 32767)
+        y = np.clip(np.round(r[N // 2:] * GAIN * 32768), -32768, 32767)
         rms = np.sqrt(np.mean(y ** 2))
         if rms < 30:                     # silent (a voice above Nyquist, or AUX with nothing on it)
             continue
